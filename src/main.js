@@ -110,7 +110,7 @@ async function init() {
   $('#clear-data').addEventListener('click', clearData);
   $('#mobile-menu').addEventListener('click', () => document.querySelector('.sidebar').classList.toggle('mobile-open'));
   bluetooth.onPeer(peer => renderPeers(bluetooth.getPeers()));
-  if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('/sw.js').catch(()=>{});
+  if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).catch(()=>{});
 }
 async function startScan() {
   if (scanning) {

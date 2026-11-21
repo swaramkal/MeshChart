@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#090d18">
   <meta name="description" content="MeshChat — private messaging without internet.">
-  <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./assets/icon.svg" type="image/svg+xml">
   <title>MeshChat — Offline Messenger</title>
 </head>
 <body>
@@ -33,6 +33,6 @@
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <dialog id="profile-dialog" class="modal"><form method="dialog" id="profile-form"><div class="modal-head"><div><div class="eyebrow">YOUR IDENTITY</div><h2>Set up your profile</h2></div><button class="icon-button" value="cancel" aria-label="Close">×</button></div><label for="name-field">Display name</label><input id="name-field" maxlength="32" required placeholder="Your name"><div class="modal-actions"><button class="secondary-button" value="cancel">Cancel</button><button class="primary-button" id="save-profile" value="default">Save profile</button></div></form></dialog>
   <dialog id="info-dialog" class="modal"><form method="dialog"><div class="modal-head"><div><div class="eyebrow">ABOUT MESHCHAT</div><h2>How it works</h2></div><button class="icon-button" value="cancel">×</button></div><p>MeshChat is an offline-first messenger concept. Devices communicate directly over local wireless transports. No central message server is used. Messages are stored locally, and encryption helpers are provided for peer sessions.</p><p class="muted">This initial build does not claim that all transport, relay, group, or file-transfer features are complete.</p><div class="modal-actions"><button class="primary-button" value="cancel">Got it</button></div></form></dialog>
-  <script type="module" src="/src/main.js"></script>
+  <script type="module" src="./src/main.js"></script>
 </body>
 </html>
