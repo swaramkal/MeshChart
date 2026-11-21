@@ -29,7 +29,7 @@ export class MeshDatabase {
     return this.db.transaction(store,mode).objectStore(store);
   }
   request(req) { return new Promise((resolve,reject)=>{req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);}); }
-  async getProfile() { return (await this.request(this.transaction('profile').get('self'))) || {id:'self',name:'Swaram'}; }
+  async getProfile() { return (await this.request(this.transaction('profile').get('self'))) || {id:'self',name:''}; }
   async saveProfile(profile) { return this.request(this.transaction('profile','readwrite').put({id:'self',...profile})); }
   async getConversations() { return this.request(this.transaction('conversations').getAll()); }
   async saveConversation(conversation) {
@@ -53,6 +53,6 @@ export class MeshDatabase {
   }
   async clear() {
     await Promise.all(STORES.map(s=>this.request(this.transaction(s,'readwrite').clear())));
-    await this.saveProfile({name:'Swaram'});
+    await this.saveProfile({name:''});
   }
 }

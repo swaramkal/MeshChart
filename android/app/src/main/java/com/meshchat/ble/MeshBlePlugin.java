@@ -90,6 +90,7 @@ public class MeshBlePlugin extends Plugin {
     private AdvertiseCallback activeAdvertiseCallback;
 
     private PluginCall pendingAdvertiseCall;
+    private String advertisingDisplayName = "MeshChat";
 
     private final Map<String, BluetoothGatt> activeGatts = new HashMap<>();
     private final Map<String, PluginCall> pendingConnectCalls = new HashMap<>();
@@ -321,11 +322,36 @@ public class MeshBlePlugin extends Plugin {
 
                     peer.put("deviceId", device.getAddress());
 
-                    String name = device.getName();
+                    String name = null;
+                    android.bluetooth.le.ScanRecord record =
+                        result.getScanRecord();
+
+                    if (record != null) {
+                        byte[] advertisedName = record.getServiceData(
+                            new ParcelUuid(SERVICE_UUID)
+                        );
+
+                        if (advertisedName != null && advertisedName.length > 0) {
+                            name = new String(
+                                advertisedName,
+                                StandardCharsets.UTF_8
+                            ).trim();
+                        }
+                    }
+
+                    if (name == null || name.isEmpty()) {
+                        try {
+                            name = device.getName();
+                        } catch (SecurityException ignored) {
+                            name = null;
+                        }
+                    }
 
                     peer.put(
                         "username",
-                        name != null ? name : "MeshPeer"
+                        name != null && !name.trim().isEmpty()
+                            ? name.trim()
+                            : "MeshPeer"
                     );
 
                     peer.put("rssi", result.getRssi());
@@ -407,6 +433,14 @@ public class MeshBlePlugin extends Plugin {
             }
 
             stopAdvertisingInternal();
+
+            String requestedName = call.getString("displayName");
+            advertisingDisplayName = requestedName == null
+                ? "MeshChat"
+                : requestedName.trim();
+            if (advertisingDisplayName.isEmpty()) {
+                advertisingDisplayName = "MeshChat";
+            }
 
             pendingAdvertiseCall = call;
 
@@ -644,6 +678,14 @@ public class MeshBlePlugin extends Plugin {
                     .addServiceUuid(new ParcelUuid(SERVICE_UUID))
                     .build();
 
+            AdvertiseData scanResponse =
+                new AdvertiseData.Builder()
+                    .addServiceData(
+                        new ParcelUuid(SERVICE_UUID),
+                        getAdvertisedNameBytes()
+                    )
+                    .build();
+
             activeAdvertiseCallback = new AdvertiseCallback() {
 
                 @Override
@@ -677,6 +719,7 @@ public class MeshBlePlugin extends Plugin {
             leAdvertiser.startAdvertising(
                 settings,
                 data,
+                scanResponse,
                 activeAdvertiseCallback
             );
 
@@ -687,6 +730,33 @@ public class MeshBlePlugin extends Plugin {
                 "Unable to start advertising: " + e.getMessage()
             );
         }
+    }
+
+    private byte[] getAdvertisedNameBytes() {
+        String name = advertisingDisplayName == null
+            ? "MeshChat"
+            : advertisingDisplayName.trim();
+
+        StringBuilder shortened = new StringBuilder();
+        int byteCount = 0;
+
+        for (int offset = 0; offset < name.length();) {
+            int codePoint = name.codePointAt(offset);
+            String character = new String(Character.toChars(codePoint));
+            int length = character.getBytes(StandardCharsets.UTF_8).length;
+
+            if (byteCount + length > 12) break;
+
+            shortened.append(character);
+            byteCount += length;
+            offset += Character.charCount(codePoint);
+        }
+
+        if (shortened.length() == 0) {
+            return "MeshChat".getBytes(StandardCharsets.UTF_8);
+        }
+
+        return shortened.toString().getBytes(StandardCharsets.UTF_8);
     }
 
     private void rejectPendingAdvertise(String message) {

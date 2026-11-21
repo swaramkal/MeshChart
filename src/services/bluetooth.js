@@ -14,6 +14,7 @@ export class BluetoothAdapter {
     this.native = null;
     this.nativeBound = false;
     this.advertising = false;
+    this.advertisedName = '';
     this.scanning = false;
     this.roles = new Map();
   }
@@ -125,16 +126,18 @@ export class BluetoothAdapter {
     this.nativeBound = true;
   }
 
-  async startScan() {
+  async startScan(displayName = '') {
     const native = this.getNative();
 
     if (native?.startScan) {
       await this.bindNativeEvents(native);
 
       // Each phone must advertise as well as scan.
-      if (!this.advertising) {
-        await native.startAdvertising();
+      const safeName = String(displayName || '').trim();
+      if (!this.advertising || this.advertisedName !== safeName) {
+        await native.startAdvertising({ displayName: safeName });
         this.advertising = true;
+        this.advertisedName = safeName;
       }
 
       await native.startScan({ serviceUuid: SERVICE_UUID });
@@ -165,6 +168,21 @@ export class BluetoothAdapter {
       this.server = null;
       this.characteristic = null;
     });
+  }
+
+  async updateDisplayName(displayName) {
+    const native = this.getNative();
+    const safeName = String(displayName || '').trim();
+    if (!native?.startAdvertising || !this.advertising) return;
+
+    // Avoid restarting the GATT server while a peer is connected.
+    if (this.roles.size > 0) {
+      this.advertisedName = '';
+      return;
+    }
+
+    await native.startAdvertising({ displayName: safeName });
+    this.advertisedName = safeName;
   }
 
   async connect(deviceId) {

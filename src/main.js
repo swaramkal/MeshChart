@@ -11,6 +11,7 @@ const cryptoService = new CryptoService();
 const chat = new ChatController(db);
 let activeView = 'chats';
 let scanning = false;
+let onboardingRequired = false;
 let toastTimer;
 
 function toast(message) {
@@ -77,29 +78,62 @@ function renderPeers(peers) {
 }
 async function refreshProfile() {
   const profile = await db.getProfile();
-  $('#profile-name').textContent = profile.name;
-  $('#name-field').value = profile.name;
+  const name = (profile.name || '').trim();
+  $('#profile-name').textContent = name || 'Set your name';
+  $('.avatar-self').textContent = initials(name || '?');
+  $('#name-field').value = name;
   $('#profile-edit').title = 'Edit profile';
+  return { ...profile, name };
+}
+
+function openProfileDialog(firstLaunch = false) {
+  onboardingRequired = firstLaunch;
+  const dialog = $('#profile-dialog');
+  dialog.querySelectorAll('[value="cancel"]').forEach(button => {
+    button.style.display = firstLaunch ? 'none' : '';
+  });
+  dialog.querySelector('h2').textContent = firstLaunch
+    ? 'Welcome to MeshChat'
+    : 'Edit your profile';
+  $('#name-field').required = true;
+  if (!dialog.open) dialog.showModal();
+  $('#name-field').focus();
 }
 async function saveProfile(event) {
   event.preventDefault();
   const name = $('#name-field').value.trim();
   if (!name) return;
   await db.saveProfile({name});
+  onboardingRequired = false;
+  $('#profile-dialog').querySelectorAll('[value="cancel"]').forEach(button => {
+    button.style.display = '';
+  });
   $('#profile-dialog').close();
   await refreshProfile();
+
+  try {
+    await bluetooth.updateDisplayName(name);
+  } catch (error) {
+    console.warn('Unable to refresh BLE display name:', error);
+    toast('Name saved. It will be advertised on the next discovery scan.');
+    return;
+  }
+
   toast('Profile saved on this device.');
 }
 async function init() {
   await db.open();
-  await refreshProfile();
+  const savedProfile = await refreshProfile();
   await chat.load();
   renderChatList();
   $('#network-state').textContent = 'Ready · offline mode';
   $('#top-status').textContent = 'Offline-ready · No internet required';
-  $('#profile-edit').addEventListener('click', () => $('#profile-dialog').showModal());
-  $('#settings-profile').addEventListener('click', () => $('#profile-dialog').showModal());
+  $('#profile-edit').addEventListener('click', () => openProfileDialog(false));
+  $('#settings-profile').addEventListener('click', () => openProfileDialog(false));
   $('#profile-form').addEventListener('submit', saveProfile);
+  $('#profile-dialog').addEventListener('cancel', event => {
+    if (onboardingRequired) event.preventDefault();
+  });
   $('#chat-search').addEventListener('input', renderChatList);
   $('#discover-cta').addEventListener('click', () => { setView('nearby'); startScan(); });
   $('#scan-button').addEventListener('click', startScan);
@@ -132,13 +166,18 @@ async function init() {
     }
   });
   if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).catch(()=>{});
+
+  if (!savedProfile.name) {
+    openProfileDialog(true);
+  }
 }
 async function startScan() {
   if (scanning) {
     await bluetooth.stopScan(); scanning=false; $('#scan-button').textContent='Start discovery'; $('#discovery-title').textContent='Discovery paused'; return;
   }
   try {
-    await bluetooth.startScan();
+    const profile = await db.getProfile();
+    await bluetooth.startScan(profile.name || 'MeshChat');
     scanning=true;
     $('#scan-button').textContent='Stop discovery';
     $('#discovery-title').textContent='Looking for devices…';
@@ -175,6 +214,7 @@ async function clearData() {
   await db.clear(); await chat.load(); chat.activePeerId=null;
   $('#conversation-panel').classList.add('hidden'); $('#welcome-panel').classList.remove('hidden');
   await refreshProfile(); renderChatList(); renderPeers([]);
+  openProfileDialog(true);
   toast('Local data cleared.');
 }
 init().catch(error => { console.error(error); toast(`Startup error: ${error.message}`); });
