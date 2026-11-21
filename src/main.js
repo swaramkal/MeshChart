@@ -62,10 +62,16 @@ function renderPeers(peers) {
   document.querySelectorAll('.connect-peer').forEach(button => button.addEventListener('click', async () => {
     const peer = { id: button.dataset.peer, name: button.dataset.name };
     try {
-      await db.saveConversation({peerId:peer.id,peerName:peer.name,connected:false});
+      await bluetooth.connect(peer.id);
+      await db.saveConversation({
+        peerId: peer.id,
+        peerName: peer.name,
+        connected: true
+      });
       await chat.load();
-      toast('Peer saved. Secure transport handshake is not yet enabled in this build.');
-      renderChatList(); openConversation(peer.id);
+      toast('Bluetooth connected. Secure chat handshake is not enabled yet; messages remain local.');
+      renderChatList();
+      openConversation(peer.id);
     } catch (error) { toast(error.message); }
   }));
 }
@@ -108,8 +114,23 @@ async function init() {
   document.querySelectorAll('.nav-link').forEach(el => el.addEventListener('click', () => setView(el.dataset.view)));
   $('#export-data').addEventListener('click', exportData);
   $('#clear-data').addEventListener('click', clearData);
-  $('#mobile-menu').addEventListener('click', () => document.querySelector('.sidebar').classList.toggle('mobile-open'));
+  $('#mobile-menu')?.addEventListener('click', () => document.querySelector('.sidebar')?.classList.toggle('mobile-open'));
   bluetooth.onPeer(peer => renderPeers(bluetooth.getPeers()));
+
+  bluetooth.onIncomingConnection(async peer => {
+    try {
+      await db.saveConversation({
+        peerId: peer.id,
+        peerName: peer.name || 'Nearby MeshChat device',
+        connected: true
+      });
+      await chat.load();
+      renderChatList();
+      toast('A nearby MeshChat device connected.');
+    } catch (error) {
+      console.error('Unable to save incoming peer:', error);
+    }
+  });
   if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).catch(()=>{});
 }
 async function startScan() {
