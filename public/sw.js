@@ -1,5 +1,5 @@
 const BASE = self.registration.scope;
-const CACHE = 'meshchat-shell-v2';
+const CACHE = 'meshchat-shell-v3';
 
 const CORE = [
   BASE,
