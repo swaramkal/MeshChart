@@ -1,85 +1,38 @@
-# MeshChat — Offline Messenger
+# MeshChat — Remaining Development Plan
 
-**Connect Without Internet.**
+**Tagline:** Connect Without Internet.
 
-MeshChat is an offline-first Android messaging project. This repository contains a responsive application shell, local IndexedDB storage, ECDH/AES-GCM cryptographic utilities, a Web Bluetooth adapter, PWA support, tests, and an automated Android build workflow.
+This ZIP contains planning and verification documents only. It does not contain application source code, does not modify the current project, and does not instruct GitHub to delete files.
 
-## Current implementation status
+## Documents
 
-| Feature | Status in this source package |
-|---|---|
-| Responsive app UI | Implemented |
-| Local profile and conversation storage | Implemented |
-| Local message history | Implemented |
-| Export and clear local data | Implemented |
-| ECDH P-256 key agreement utility | Implemented and unit-tested |
-| AES-256-GCM encryption utility | Implemented and unit-tested |
-| PWA shell caching | Implemented |
-| Browser Bluetooth device selection | Experimental; browser support required |
-| Native Android BLE plugin | Not yet implemented |
-| Reliable two-way peer messaging | Not yet implemented |
-| BLE packet fragmentation / retransmission | Not yet implemented |
-| Mesh store-and-forward relay | Not yet implemented |
-| Group key management and group chat | Not yet implemented |
-| Encrypted file transfer | Not yet implemented |
-| Background Android discovery | Not yet implemented |
+- `IMPLEMENTATION_AUDIT.md` — what is present in the uploaded source ZIP and what is still incomplete.
+- `REQUIREMENTS.md` — product, functional, security, privacy, and reliability requirements.
+- `DEVELOPMENT_STAGES.md` — ordered implementation stages with completion criteria.
+- `TESTING_CHECKLIST.md` — checks required before marking each feature complete.
+- `FILE_CLEANUP.md` — files to preserve, documentation mismatches, and safe cleanup rules.
 
-**Important:** The current UI stores outgoing messages locally. It does not yet deliver them to another phone. The peer discovery adapter is experimental and must not be mistaken for a complete native Android BLE implementation. This project intentionally does not display fake delivery receipts.
+## Important project naming
 
-## Requirements
+- Repository/project folder in the uploaded ZIP: `MeshChart-main`
+- GitHub repository name: `MeshChart`
+- Application name: `MeshChat`
 
-- Node.js 20+
-- npm 10+
-- Java 21 for Android builds
-- Android SDK API 36 for local Android builds
+Keep the existing repository name and application ID unless a deliberate migration is planned.
 
-## Run the web application
+## How to use this plan
 
-```bash
-npm install
-npm test
-npm run dev
-```
+1. Keep a backup of the current project ZIP and the working Termux project.
+2. Add these documents to the repository, for example under `docs/plan/`.
+3. Work through `DEVELOPMENT_STAGES.md` in order.
+4. Do not mark a stage complete merely because its code exists. Use the acceptance checks in `TESTING_CHECKLIST.md`.
+5. Do not delete files based only on `FILE_CLEANUP.md`; inspect and back them up first.
 
-Open the local Vite URL in a modern browser. Bluetooth APIs generally require a secure context (HTTPS or localhost).
+## Snapshot limitation
 
-## Android project
+The uploaded ZIP is a repository snapshot. It does not include every newer uncommitted change described in the ongoing development conversation. In particular, the latest local packet-transport implementation and its tests were present in the Termux working project but are absent from the uploaded ZIP snapshot. The audit therefore distinguishes:
+- what is visible in the uploaded ZIP;
+- what was reported and verified in the current working project during this conversation; and
+- what still needs Android compilation or real-device testing.
 
-The Android shell is generated from the Capacitor configuration:
-
-```bash
-npm install
-npm run build
-npx cap add android
-npx cap sync android
-cd android
-./gradlew assembleDebug
-```
-
-The generated Android project is intentionally not committed in this starter source archive. GitHub Actions generates it during the Android build.
-
-## GitHub Actions
-
-Push this project to a GitHub repository using the `main` branch. The workflow at `.github/workflows/android-build.yml` runs tests, builds the web app, generates the Android project, and uploads a debug APK artifact.
-
-## Security notes
-
-- ECDH P-256 and AES-256-GCM are implemented using Web Crypto.
-- The current demo utility creates ephemeral in-memory key pairs. Production identity persistence, key rotation, peer authentication, replay protection, and secure group key distribution still need implementation and independent review.
-- IndexedDB is local browser storage, not encrypted-at-rest storage.
-- Do not use this build for sensitive communications until the complete transport and security design has been implemented and audited.
-
-## Architecture
-
-- `src/main.js` — application UI orchestration
-- `src/services/database.js` — IndexedDB persistence
-- `src/services/crypto.js` — cryptographic primitives
-- `src/services/bluetooth.js` — experimental Web Bluetooth adapter
-- `src/services/chat.js` — local conversation/message model
-- `tests/` — automated unit tests
-- `public/` — PWA manifest, service worker, app icon
-- `.github/workflows/` — automated Android build
-
-## License
-
-All rights reserved unless a license is added by the repository owner.
+The current working project had 11 JavaScript tests passing, the Vite production build passing, and `git diff --check` passing on 2026-11-22. Native Android compilation and two-device BLE interoperability were not yet verified.
