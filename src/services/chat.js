@@ -15,7 +15,7 @@ export class ChatController {
   }
 
   getConversation(peerId) {
-    return this.conversations.find(c => c.peerId === peerId);
+    return this.conversations.find((c) => c.peerId === peerId);
   }
 
   async getMessages(peerId) {
@@ -32,14 +32,14 @@ export class ChatController {
       text,
       direction,
       createdAt: Date.now(),
-      status
+      status,
     };
 
     await this.db.saveMessage(message);
     await this.db.saveConversation({
       ...conversation,
       lastMessage: text,
-      updatedAt: message.createdAt
+      updatedAt: message.createdAt,
     });
     await this.load();
     return message;
