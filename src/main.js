@@ -21,14 +21,17 @@ function toast(message) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('visible'), 2800);
 }
+
 function initials(name = '?') {
   return name.trim().slice(0, 1).toUpperCase() || '?';
 }
+
 function escapeHTML(value = '') {
   return String(value).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
   );
 }
+
 function setView(view) {
   activeView = view;
   document.querySelectorAll('.view').forEach((el) =>
@@ -39,6 +42,7 @@ function setView(view) {
   );
   document.querySelector('.sidebar')?.classList.remove('mobile-open');
 }
+
 function renderChatList() {
   const chats = chat.getConversations();
   $('#chat-count').textContent = String(chats.length);
@@ -71,6 +75,7 @@ function renderChatList() {
     el.addEventListener('click', () => openConversation(el.dataset.peer))
   );
 }
+
 async function renderMessages() {
   const peerId = chat.activePeerId;
   if (!peerId) return;
@@ -98,6 +103,7 @@ async function renderMessages() {
     : '<div class="conversation-empty">This is the beginning of your conversation.</div>';
   $('#message-list').scrollTop = $('#message-list').scrollHeight;
 }
+
 async function openConversation(peerId) {
   const conversation = chat.getConversation(peerId);
   if (!conversation) return;
@@ -113,6 +119,7 @@ async function openConversation(peerId) {
   renderChatList();
   setView('chats');
 }
+
 function renderPeers(peers) {
   \( ('#peer-count').textContent = ` \){peers.length} device${peers.length === 1 ? '' : 's'}`;
   $('#peer-list').innerHTML = peers.length
@@ -151,6 +158,7 @@ function renderPeers(peers) {
     })
   );
 }
+
 async function refreshProfile() {
   const profile = await db.getProfile();
   const name = (profile.name || '').trim();
@@ -174,6 +182,7 @@ function openProfileDialog(firstLaunch = false) {
   if (!dialog.open) dialog.showModal();
   $('#name-field').focus();
 }
+
 async function saveProfile(event) {
   event.preventDefault();
   const name = $('#name-field').value.trim();
@@ -196,6 +205,7 @@ async function saveProfile(event) {
 
   toast('Profile saved on this device.');
 }
+
 async function init() {
   await db.open();
   const savedProfile = await refreshProfile();
@@ -294,6 +304,7 @@ async function init() {
     openProfileDialog(true);
   }
 }
+
 async function startScan() {
   if (scanning) {
     await bluetooth.stopScan();
@@ -316,6 +327,7 @@ async function startScan() {
       'Use the Android app on a supported device to enable native Bluetooth discovery.';
   }
 }
+
 async function sendMessage(event) {
   event.preventDefault();
   const text = $('#message-input').value.trim();
@@ -345,6 +357,7 @@ async function sendMessage(event) {
     toast(error.message || 'Failed to send over Bluetooth');
   }
 }
+
 async function handleFile(event) {
   const file = event.target.files?.[0];
   if (!file) return;
@@ -361,6 +374,7 @@ async function handleFile(event) {
   toast(`Attachment "${file.name}" recorded locally. Peer transfer is not enabled yet.`);
   event.target.value = '';
 }
+
 async function exportData() {
   const data = await db.exportAll();
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -371,6 +385,7 @@ async function exportData() {
   a.click();
   URL.revokeObjectURL(url);
 }
+
 async function clearData() {
   if (!confirm('Delete all MeshChat local data from this device? This cannot be undone.'))
     return;
@@ -385,6 +400,7 @@ async function clearData() {
   openProfileDialog(true);
   toast('Local data cleared.');
 }
+
 init().catch((error) => {
   console.error(error);
   toast(`Startup error: ${error.message}`);
