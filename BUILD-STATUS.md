@@ -1,21 +1,21 @@
-# Build and verification report
+# MeshChat Build Status
 
-Prepared: 2026-11-21
+Last verified: 2026-11-22
 
-## Checks completed in the authoring environment
+## Verified
+- JavaScript tests: 11 passed.
+- Vite production build: passed.
+- Git diff check: passed.
+- Packet fragmentation and reassembly tests: passed.
+- Cryptographic utility tests: passed.
 
-- JavaScript syntax checks: passed for all application, service, and test JavaScript files.
-- Automated cryptography tests: 2 passed, 0 failed.
-- JSON parsing: passed for package.json, capacitor.config.json, and the PWA manifest.
+## Pending verification
+- Native Android compilation.
+- Two-device BLE discovery and messaging.
+- Reliable reconnection and notification lifecycle.
+- Mesh relay and store-and-forward.
+- Group messaging.
+- Encrypted file transfer.
+- Background Android operation.
 
-## Checks not completed
-
-- Vite production bundle: not run because npm dependency installation timed out in the authoring environment.
-- Capacitor Android generation / Gradle APK build: not run.
-- BLE interoperability: not tested on physical Android devices.
-
-## Important product status
-
-This ZIP is a clean first engineering foundation, not a finished production messenger. The UI, local persistence, PWA shell, cryptographic utility, and experimental browser Bluetooth selection are present. Native Android BLE transport, reliable peer-to-peer delivery, packet fragmentation, mesh relay, group encryption, and encrypted file transfer are not yet implemented. The app deliberately does not fake message delivery.
-
-The GitHub Actions workflow is configured to install dependencies, run tests, build the web bundle, generate the Capacitor Android project, and build a debug APK. A successful workflow run is still required before treating the APK build as verified.
+See docs/TESTING_CHECKLIST.md before marking features complete.

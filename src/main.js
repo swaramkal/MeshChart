@@ -3,6 +3,7 @@ import { MeshDatabase } from './services/database.js';
 import { CryptoService } from './services/crypto.js';
 import { BluetoothAdapter } from './services/bluetooth.js';
 import { ChatController } from './services/chat.js';
+import { PairingController } from './services/pairing.js';
 
 const $ = (selector) => document.querySelector(selector);
 const db = new MeshDatabase();
@@ -13,6 +14,8 @@ let activeView = 'chats';
 let scanning = false;
 let onboardingRequired = false;
 let toastTimer;
+let activePairingPeerId = null;
+const pairingStates = new Map();
 
 function toast(message) {
   const el = $('#toast');
@@ -21,6 +24,95 @@ function toast(message) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('visible'), 2800);
 }
+
+
+function pairingStatusText(status) {
+  const messages = {
+    negotiating: 'Establishing a secure connection…',
+    'awaiting-confirmation': 'Compare the six-digit code on both phones. Confirm only if they match.',
+    'awaiting-peer-confirmation': 'Waiting for the other person to confirm the matching code…',
+    secure: 'Secure pairing confirmed. Encrypted one-to-one messaging is ready.',
+    timeout: 'Pairing timed out. Reconnect and try again.',
+    failed: 'Pairing failed. Please reconnect and try again.',
+    disconnected: 'Bluetooth disconnected. Pairing was cancelled.',
+    'peer-cancelled': 'The other device cancelled pairing.',
+    'verification-failed': 'Verification failed. Pair again.',
+    cancelled: 'Pairing cancelled.',
+    restarted: 'Pairing restarted.',
+    destroyed: 'Pairing session ended.'
+  };
+  return messages[status] || `Pairing status: ${String(status || 'unknown')}`;
+}
+
+function renderPairingState(state) {
+  pairingStates.set(state.peerId, state);
+
+  if (!activePairingPeerId || activePairingPeerId === state.peerId) {
+    activePairingPeerId = state.peerId;
+  } else {
+    return;
+  }
+
+  const dialog = $('#pairing-dialog');
+  if (!dialog) return;
+
+  $('#pairing-peer-name').textContent = state.peerName || 'Nearby device';
+  $('#pairing-status').textContent = pairingStatusText(state.status);
+  $('#pairing-code').textContent = state.verificationCode || '------';
+  $('#pairing-code-wrap').classList.toggle('hidden', !state.verificationCode);
+
+  const terminal = [
+    'secure', 'timeout', 'failed', 'disconnected',
+    'peer-cancelled', 'verification-failed', 'cancelled',
+    'restarted', 'destroyed'
+  ].includes(state.status);
+
+  $('#pairing-confirm').classList.toggle(
+    'hidden', state.status !== 'awaiting-confirmation'
+  );
+  $('#pairing-cancel').textContent = terminal ? 'Close' : 'Cancel pairing';
+
+  if (!dialog.open) dialog.showModal();
+}
+
+const pairing = new PairingController(bluetooth, {
+  onState: renderPairingState,
+  onSecure: (peerId) => {
+    toast('Secure pairing confirmed. Encrypted chat is ready.');
+    if (chat.activePeerId === peerId) {
+      $('#conversation-status').textContent = 'Secure paired · encrypted chat';
+    }
+  }
+});
+
+// Encrypt every chat payload using the key established by verified pairing.
+async function sendSecurePayload(peerId, payload) {
+  const session = pairing.getSecureSession(peerId);
+  if (!session || !session.sessionId || !session.encryptionKey) {
+    throw new Error('Secure pairing is required before sending messages.');
+  }
+
+  const additionalData = `MeshChat message v1:${session.sessionId}`;
+  const encrypted = await cryptoService.encrypt(
+    session.encryptionKey,
+    JSON.stringify(payload),
+    additionalData
+  );
+
+  const packet = JSON.stringify({
+    v: 1,
+    type: 'message',
+    sessionId: session.sessionId,
+    encrypted
+  });
+
+  if (new TextEncoder().encode(packet).length > 2900) {
+    throw new Error('Message is too large for the current Bluetooth transport.');
+  }
+
+  return bluetooth.send(packet, peerId);
+}
+
 
 function initials(name = '?') {
   return name.trim().slice(0, 1).toUpperCase() || '?';
@@ -43,117 +135,138 @@ function setView(view) {
   document.querySelector('.sidebar')?.classList.remove('mobile-open');
 }
 
+
 function renderChatList() {
   const chats = chat.getConversations();
   $('#chat-count').textContent = String(chats.length);
+
   const query = $('#chat-search').value.trim().toLowerCase();
-  const filtered = chats.filter((c) => c.peerName.toLowerCase().includes(query));
+  const filtered = chats.filter((c) =>
+    String(c.peerName || '').toLowerCase().includes(query)
+  );
+
   $('#chat-list').innerHTML = filtered.length
-    ? filtered
-        .map(
-          (c) =>
-            `<button class="chat-item ${
-              chat.activePeerId === c.peerId ? 'selected' : ''
-            }" data-peer="\( {escapeHTML(c.peerId)}"><span class="avatar"> \){escapeHTML(
-              initials(c.peerName)
-            )}</span><span class="chat-item-copy"><strong>${escapeHTML(
-              c.peerName
-            )}</strong><small>${escapeHTML(
-              c.lastMessage || 'Start a conversation'
-            )}</small></span><small class="chat-time">${
-              c.updatedAt
-                ? new Date(c.updatedAt).toLocaleTimeString([], {
-                    hour: '2-digit',
-                    minute: '2-digit',
-                  })
-                : ''
-            }</small></button>`
-        )
-        .join('')
+    ? filtered.map((c) => `
+      <button class="chat-item ${chat.activePeerId === c.peerId ? 'selected' : ''}"
+        data-peer="${escapeHTML(c.peerId)}">
+        <span class="avatar">${escapeHTML(initials(c.peerName))}</span>
+        <span class="chat-item-copy">
+          <strong>${escapeHTML(c.peerName)}</strong>
+          <small>${escapeHTML(c.lastMessage || 'Start a conversation')}</small>
+        </span>
+        <small class="chat-time">${
+          c.updatedAt
+            ? new Date(c.updatedAt).toLocaleTimeString([], {
+                hour: '2-digit', minute: '2-digit'
+              })
+            : ''
+        }</small>
+      </button>
+    `).join('')
     : '<div class="empty-small">No conversations found.</div>';
+
   document.querySelectorAll('.chat-item').forEach((el) =>
     el.addEventListener('click', () => openConversation(el.dataset.peer))
   );
 }
 
+
 async function renderMessages() {
   const peerId = chat.activePeerId;
   if (!peerId) return;
+
   const messages = await chat.getMessages(peerId);
   const statusLabel = (status) => {
+    if (status === 'delivered') return ' · delivered';
     if (status === 'sent') return ' · sent';
     if (status === 'failed') return ' · failed';
-    if (status === 'queued') return ' · queued';
+    if (status === 'queued') return ' · sending';
     return '';
   };
+
   $('#message-list').innerHTML = messages.length
-    ? messages
-        .map(
-          (m) =>
-            `<div class="message-row ${
-              m.direction === 'out' ? 'outgoing' : 'incoming'
-            }"><div class="message-bubble">\( {escapeHTML(m.text)}<small> \){new Date(
-              m.createdAt
-            ).toLocaleTimeString([], {
-              hour: '2-digit',
-              minute: '2-digit',
-            })}${statusLabel(m.status)}</small></div></div>`
-        )
-        .join('')
+    ? messages.map((m) => `
+      <div class="message-row ${m.direction === 'out' ? 'outgoing' : 'incoming'}">
+        <div class="message-bubble">
+          ${escapeHTML(m.text)}
+          <small>${new Date(m.createdAt).toLocaleTimeString([], {
+            hour: '2-digit', minute: '2-digit'
+          })}${statusLabel(m.status)}</small>
+        </div>
+      </div>
+    `).join('')
     : '<div class="conversation-empty">This is the beginning of your conversation.</div>';
+
   $('#message-list').scrollTop = $('#message-list').scrollHeight;
 }
+
 
 async function openConversation(peerId) {
   const conversation = chat.getConversation(peerId);
   if (!conversation) return;
+
   chat.activePeerId = peerId;
   $('#welcome-panel').classList.add('hidden');
   $('#conversation-panel').classList.remove('hidden');
   $('#conversation-name').textContent = conversation.peerName;
   $('#conversation-avatar').textContent = initials(conversation.peerName);
-  $('#conversation-status').textContent = conversation.connected
-    ? 'Connected nearby'
-    : 'Saved conversation · not connected';
+
+  $('#conversation-status').textContent = pairing.isSecure(peerId)
+    ? 'Secure paired · encrypted chat'
+    : conversation.connected
+      ? 'Connected nearby · pairing required'
+      : 'Saved conversation · not connected';
+
   await renderMessages();
   renderChatList();
   setView('chats');
 }
 
+
 function renderPeers(peers) {
-  \( ('#peer-count').textContent = ` \){peers.length} device${peers.length === 1 ? '' : 's'}`;
+  $('#peer-count').textContent =
+    `${peers.length} device${peers.length === 1 ? '' : 's'}`;
+
   $('#peer-list').innerHTML = peers.length
-    ? peers
-        .map(
-          (p) =>
-            `<div class="peer-item"><span class="avatar">${escapeHTML(
-              initials(p.name)
-            )}</span><div class="peer-copy"><strong>${escapeHTML(
-              p.name
-            )}</strong><small>${escapeHTML(
-              p.id
-            )}</small></div><span class="peer-signal">Nearby</span><button class="secondary-button connect-peer" data-peer="${escapeHTML(
-              p.id
-            )}" data-name="${escapeHTML(p.name)}">Connect</button></div>`
-        )
-        .join('')
+    ? peers.map((p) => `
+      <div class="peer-item">
+        <span class="avatar">${escapeHTML(initials(p.name))}</span>
+        <div class="peer-copy">
+          <strong>${escapeHTML(p.name)}</strong>
+          <small>${escapeHTML(p.id)}</small>
+        </div>
+        <span class="peer-signal">Nearby</span>
+        <button class="secondary-button connect-peer"
+          data-peer="${escapeHTML(p.id)}"
+          data-name="${escapeHTML(p.name)}">Connect</button>
+      </div>
+    `).join('')
     : '<div class="empty-state">No devices discovered yet.</div>';
+
   document.querySelectorAll('.connect-peer').forEach((button) =>
     button.addEventListener('click', async () => {
-      const peer = { id: button.dataset.peer, name: button.dataset.name };
+      const peer = {
+        id: button.dataset.peer,
+        name: button.dataset.name
+      };
+
       try {
         await bluetooth.connect(peer.id);
         await db.saveConversation({
           peerId: peer.id,
           peerName: peer.name,
-          connected: true,
+          connected: true
         });
         await chat.load();
-        toast('Bluetooth connected. You can send short messages now.');
+
+        activePairingPeerId = peer.id;
+        await pairing.start(peer.id, peer.name);
+
         renderChatList();
-        openConversation(peer.id);
+        await openConversation(peer.id);
+        toast('Connected. Compare the verification codes on both phones.');
       } catch (error) {
-        toast(error.message);
+        toast(error.message || 'Bluetooth connection failed.');
       }
     })
   );
@@ -254,6 +367,40 @@ async function init() {
   );
   bluetooth.onPeer((peer) => renderPeers(bluetooth.getPeers()));
 
+
+  $('#pairing-confirm').addEventListener('click', async () => {
+    if (!activePairingPeerId) return;
+
+    const button = $('#pairing-confirm');
+    button.disabled = true;
+    try {
+      await pairing.confirmLocal(activePairingPeerId);
+    } catch (error) {
+      toast(error.message || 'Unable to confirm pairing.');
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  $('#pairing-cancel').addEventListener('click', () => {
+    const peerId = activePairingPeerId;
+    const state = peerId ? pairingStates.get(peerId) : null;
+    const terminal = state && [
+      'secure', 'timeout', 'failed', 'disconnected',
+      'peer-cancelled', 'verification-failed', 'cancelled',
+      'restarted', 'destroyed'
+    ].includes(state.status);
+
+    if (peerId && !terminal) pairing.cancel(peerId, 'cancelled', true);
+    $('#pairing-dialog').close();
+    activePairingPeerId = null;
+  });
+
+  $('#pairing-dialog').addEventListener('cancel', (event) => {
+    event.preventDefault();
+    $('#pairing-cancel').click();
+  });
+
   bluetooth.onIncomingConnection(async (peer) => {
     try {
       await db.saveConversation({
@@ -269,29 +416,72 @@ async function init() {
     }
   });
 
-  // Receive packets from the other phone and show them in the chat
+
+  // Only accept encrypted chat packets from an established pairing session.
   bluetooth.onMessage(async ({ data, peerId }) => {
     if (!data || !peerId) return;
 
     try {
+      let packet;
+      try {
+        packet = JSON.parse(data);
+      } catch {
+        return; // Never display legacy plaintext packets.
+      }
+
+      if (packet?.v !== 1 || packet.type !== 'message') return;
+
+      const session = pairing.getSecureSession(peerId);
+      if (!session || packet.sessionId !== session.sessionId) return;
+
+      const additionalData = `MeshChat message v1:${session.sessionId}`;
+      const plaintext = await cryptoService.decrypt(
+        session.encryptionKey,
+        packet.encrypted,
+        additionalData
+      );
+
+      const payload = JSON.parse(plaintext);
+
+      if (payload?.kind === 'ack' && typeof payload.id === 'string') {
+        await chat.updateMessageStatus(payload.id, 'delivered');
+        if (chat.activePeerId === peerId) await renderMessages();
+        renderChatList();
+        return;
+      }
+
+      if (
+        payload?.kind !== 'text' ||
+        typeof payload.id !== 'string' ||
+        typeof payload.text !== 'string' ||
+        !payload.text.trim()
+      ) {
+        return;
+      }
+
       let conversation = chat.getConversation(peerId);
       if (!conversation) {
         const known = bluetooth.getPeers().find((p) => p.id === peerId);
         await db.saveConversation({
           peerId,
           peerName: known?.name || 'Nearby MeshChat device',
-          connected: true,
+          connected: true
         });
         await chat.load();
       }
 
-      await chat.addMessage(peerId, data, 'in', 'sent');
-      if (chat.activePeerId === peerId) {
-        await renderMessages();
-      }
+      await chat.addMessage(peerId, payload.text, 'in', 'delivered');
+
+      // Send a cryptographically protected receipt to the sender.
+      await sendSecurePayload(peerId, {
+        kind: 'ack',
+        id: payload.id
+      });
+
+      if (chat.activePeerId === peerId) await renderMessages();
       renderChatList();
     } catch (error) {
-      console.error('Failed to store incoming message:', error);
+      console.error('Encrypted message processing failed:', error);
     }
   });
 
@@ -328,33 +518,45 @@ async function startScan() {
   }
 }
 
+
 async function sendMessage(event) {
   event.preventDefault();
-  const text = $('#message-input').value.trim();
-  if (!text || !chat.activePeerId) return;
 
-  // Keep messages short until fragmentation is added (default BLE MTU \~20 bytes payload)
-  if (new TextEncoder().encode(text).length > 18) {
-    toast('Message too long for current BLE limit. Keep it under \~18 characters for now.');
+  const text = $('#message-input').value.trim();
+  const peerId = chat.activePeerId;
+  if (!text || !peerId) return;
+
+  if (!pairing.isSecure(peerId)) {
+    toast('Pair and verify this device before sending messages.');
     return;
   }
 
-  const peerId = chat.activePeerId;
+  // Leave room for JSON and AES-GCM overhead in the BLE packet limit.
+  if (new TextEncoder().encode(text).length > 1400) {
+    toast('Message is too long for this development build.');
+    return;
+  }
+
   const message = await chat.addMessage(peerId, text, 'out', 'queued');
   $('#message-input').value = '';
+
+  // Set sent before transport so a fast encrypted acknowledgement cannot be overwritten.
+  await chat.updateMessageStatus(message.id, 'sent');
   await renderMessages();
   renderChatList();
 
   try {
-    await bluetooth.send(text, peerId);
-    await chat.updateMessageStatus(message.id, 'sent');
-    await renderMessages();
-    toast('Sent over Bluetooth');
+    await sendSecurePayload(peerId, {
+      kind: 'text',
+      id: String(message.id),
+      text
+    });
+    toast('Encrypted message sent. Waiting for receipt…');
   } catch (error) {
-    console.error('BLE send failed:', error);
+    console.error('Encrypted BLE send failed:', error);
     await chat.updateMessageStatus(message.id, 'failed');
     await renderMessages();
-    toast(error.message || 'Failed to send over Bluetooth');
+    toast(error.message || 'Message could not be sent.');
   }
 }
 

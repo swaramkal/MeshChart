@@ -24,6 +24,7 @@ import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.util.Base64;
 import android.os.ParcelUuid;
 
 import androidx.core.content.ContextCompat;
@@ -38,7 +39,9 @@ import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -96,8 +99,33 @@ public class MeshBlePlugin extends Plugin {
     private final Map<String, PluginCall> pendingConnectCalls = new HashMap<>();
     private final Map<String, PluginCall> pendingWriteCalls = new HashMap<>();
     private final Map<String, Integer> negotiatedMtus = new HashMap<>();
+    private final Map<String, Integer> serverNegotiatedMtus = new HashMap<>();
 
     private final Set<String> subscribedDevices = new HashSet<>();
+
+    private final ArrayDeque<PendingNotification> notificationQueue =
+        new ArrayDeque<>();
+    private boolean notificationInFlight = false;
+    private String inFlightNotificationAddress = null;
+
+    private static final class PendingNotification {
+        final BluetoothDevice device;
+        final String address;
+        final byte[] bytes;
+        final PluginCall call;
+        boolean settled = false;
+
+        PendingNotification(
+            BluetoothDevice device,
+            byte[] bytes,
+            PluginCall call
+        ) {
+            this.device = device;
+            this.address = device.getAddress();
+            this.bytes = bytes;
+            this.call = call;
+        }
+    }
 
     @Override
     public void load() {
@@ -556,11 +584,19 @@ public class MeshBlePlugin extends Plugin {
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
 
                     subscribedDevices.remove(address);
+                    cleanupServerNotifications(address);
 
                     JSObject event = new JSObject();
                     event.put("deviceId", address);
 
                     notifyListeners("onPeerDisconnected", event);
+                }
+            }
+
+            @Override
+            public void onMtuChanged(BluetoothDevice device, int mtu) {
+                if (device != null && mtu >= 23) {
+                    serverNegotiatedMtus.put(device.getAddress(), mtu);
                 }
             }
 
@@ -578,13 +614,18 @@ public class MeshBlePlugin extends Plugin {
 
                 int responseStatus = BluetoothGatt.GATT_SUCCESS;
 
+                int mtu = serverNegotiatedMtus.containsKey(device.getAddress())
+                    ? serverNegotiatedMtus.get(device.getAddress()) : 23;
+                int maximumPayload = mtu - 3;
+
                 if (!RX_CHAR_UUID.equals(characteristic.getUuid())
                     || preparedWrite
                     || offset != 0
-                    || value == null) {
+                    || value == null
+                    || value.length == 0
+                    || value.length > maximumPayload) {
 
                     responseStatus = BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH;
-
                 } else {
                     emitPacket(device.getAddress(), value);
                 }
@@ -601,6 +642,48 @@ public class MeshBlePlugin extends Plugin {
                     } catch (SecurityException ignored) {
                     }
                 }
+            }
+
+            @Override
+            public void onNotificationSent(
+                BluetoothDevice device,
+                int status
+            ) {
+                if (device == null) return;
+
+                PendingNotification completed = null;
+
+                synchronized (notificationQueue) {
+                    String callbackAddress = device.getAddress();
+
+                    if (!notificationInFlight
+                        || inFlightNotificationAddress == null
+                        || !inFlightNotificationAddress.equals(callbackAddress)) {
+                        return;
+                    }
+
+                    PendingNotification head = notificationQueue.peek();
+
+                    if (head == null || !head.address.equals(callbackAddress)) {
+                        return;
+                    }
+
+                    completed = notificationQueue.poll();
+                    notificationInFlight = false;
+                    inFlightNotificationAddress = null;
+                }
+
+                if (!completed.settled) {
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        completed.call.resolve();
+                    } else {
+                        completed.call.reject(
+                            "BLE notification failed with status " + status + "."
+                        );
+                    }
+                }
+
+                sendNextNotification();
             }
 
             @Override
@@ -634,6 +717,7 @@ public class MeshBlePlugin extends Plugin {
                     && value[1] == 0) {
 
                     subscribedDevices.remove(device.getAddress());
+                    cleanupServerNotifications(device.getAddress());
 
                 } else {
                     status = BluetoothGatt.GATT_FAILURE;
@@ -777,6 +861,8 @@ public class MeshBlePlugin extends Plugin {
     }
 
     private void stopAdvertisingInternal() {
+        rejectAllServerNotifications();
+
         if (leAdvertiser != null && activeAdvertiseCallback != null) {
             try {
                 leAdvertiser.stopAdvertising(activeAdvertiseCallback);
@@ -1170,12 +1256,12 @@ public class MeshBlePlugin extends Plugin {
     // ---------------------------------------------------------
 
     private void emitPacket(String senderId, byte[] value) {
-        String data = new String(value, StandardCharsets.UTF_8);
+        if (senderId == null || value == null || value.length == 0) return;
 
         JSObject event = new JSObject();
         event.put("senderId", senderId);
         event.put("deviceId", senderId);
-        event.put("data", data);
+        event.put("dataBase64", Base64.encodeToString(value, Base64.NO_WRAP));
 
         notifyListeners("onPacketReceived", event);
     }
@@ -1183,15 +1269,27 @@ public class MeshBlePlugin extends Plugin {
     @PluginMethod
     public void writePacket(PluginCall call) {
         String address = call.getString("deviceId");
-        String data = call.getString("data", "");
+        String dataBase64 = call.getString("dataBase64");
 
-        if (address == null) {
-            call.reject("Missing deviceId.");
+        if (address == null || dataBase64 == null || dataBase64.isEmpty()) {
+            call.reject("Missing deviceId or dataBase64.");
+            return;
+        }
+
+        byte[] bytes;
+        try {
+            bytes = Base64.decode(dataBase64, Base64.NO_WRAP);
+        } catch (IllegalArgumentException e) {
+            call.reject("Invalid Base64 packet data.", e);
+            return;
+        }
+
+        if (bytes.length == 0) {
+            call.reject("Empty BLE packet.");
             return;
         }
 
         BluetoothGatt gatt = activeGatts.get(address);
-
         if (gatt == null) {
             call.reject("Peer is not connected over GATT.");
             return;
@@ -1202,30 +1300,19 @@ public class MeshBlePlugin extends Plugin {
             return;
         }
 
-        byte[] bytes = data.getBytes(StandardCharsets.UTF_8);
-
         int mtu = negotiatedMtus.containsKey(address)
-            ? negotiatedMtus.get(address)
-            : 23;
-
+            ? negotiatedMtus.get(address) : 23;
         int maximumPayload = mtu - 3;
 
         if (bytes.length > maximumPayload) {
-            call.reject(
-                "Packet exceeds negotiated BLE payload limit of "
-                    + maximumPayload
-                    + " bytes. Fragmentation is not implemented yet."
-            );
+            call.reject("Packet exceeds negotiated BLE payload limit of "
+                + maximumPayload + " bytes.");
             return;
         }
 
-        BluetoothGattService service =
-            gatt.getService(SERVICE_UUID);
-
-        BluetoothGattCharacteristic rx =
-            service != null
-                ? service.getCharacteristic(RX_CHAR_UUID)
-                : null;
+        BluetoothGattService service = gatt.getService(SERVICE_UUID);
+        BluetoothGattCharacteristic rx = service != null
+            ? service.getCharacteristic(RX_CHAR_UUID) : null;
 
         if (rx == null) {
             call.reject("MeshChat GATT RX characteristic not found.");
@@ -1233,19 +1320,14 @@ public class MeshBlePlugin extends Plugin {
         }
 
         try {
-            rx.setWriteType(
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            );
-
+            rx.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
             rx.setValue(bytes);
-
             pendingWriteCalls.put(address, call);
 
             if (!gatt.writeCharacteristic(rx)) {
                 pendingWriteCalls.remove(address);
                 call.reject("Android rejected the GATT write request.");
             }
-
         } catch (SecurityException e) {
             pendingWriteCalls.remove(address);
             call.reject("Bluetooth write permission missing.", e);
@@ -1258,11 +1340,14 @@ public class MeshBlePlugin extends Plugin {
     @PluginMethod
     public void notifyPacket(PluginCall call) {
         String address = call.getString("deviceId");
-        String data = call.getString("data", "");
+        String dataBase64 = call.getString("dataBase64");
 
-        if (address == null || gattServer == null
-            || serverTxCharacteristic == null) {
+        if (address == null || dataBase64 == null || dataBase64.isEmpty()) {
+            call.reject("Missing deviceId or dataBase64.");
+            return;
+        }
 
+        if (gattServer == null || serverTxCharacteristic == null) {
             call.reject("GATT server is not available.");
             return;
         }
@@ -1272,31 +1357,159 @@ public class MeshBlePlugin extends Plugin {
             return;
         }
 
+        byte[] bytes;
         try {
-            BluetoothDevice device =
-                bluetoothAdapter.getRemoteDevice(address);
+            bytes = Base64.decode(dataBase64, Base64.NO_WRAP);
+        } catch (IllegalArgumentException e) {
+            call.reject("Invalid Base64 packet data.", e);
+            return;
+        }
 
-            byte[] bytes = data.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length == 0) {
+            call.reject("Empty BLE packet.");
+            return;
+        }
 
-            serverTxCharacteristic.setValue(bytes);
+        int mtu = serverNegotiatedMtus.containsKey(address)
+            ? serverNegotiatedMtus.get(address) : 23;
 
-            boolean initiated =
-                gattServer.notifyCharacteristicChanged(
-                    device,
-                    serverTxCharacteristic,
-                    false
+        if (bytes.length > mtu - 3) {
+            call.reject("Packet exceeds negotiated BLE payload limit.");
+            return;
+        }
+
+        try {
+            BluetoothDevice device = bluetoothAdapter.getRemoteDevice(address);
+
+            synchronized (notificationQueue) {
+                notificationQueue.add(
+                    new PendingNotification(device, bytes, call)
                 );
-
-            if (initiated) {
-                call.resolve();
-            } else {
-                call.reject("Android rejected the notification request.");
             }
+
+            sendNextNotification();
 
         } catch (SecurityException e) {
             call.reject("Bluetooth notification permission missing.", e);
         } catch (Exception e) {
-            call.reject("Unable to send notification: " + e.getMessage(), e);
+            call.reject("Unable to queue notification: " + e.getMessage(), e);
+        }
+    }
+
+    private void sendNextNotification() {
+        synchronized (notificationQueue) {
+            if (notificationInFlight) return;
+
+            while (!notificationQueue.isEmpty()) {
+                PendingNotification pending = notificationQueue.peek();
+
+                if (gattServer == null || serverTxCharacteristic == null) {
+                    notificationQueue.poll();
+                    if (!pending.settled) {
+                        pending.call.reject("GATT server is unavailable.");
+                    }
+                    continue;
+                }
+
+                if (!subscribedDevices.contains(pending.address)) {
+                    notificationQueue.poll();
+                    if (!pending.settled) {
+                        pending.call.reject("Peer notification subscription ended.");
+                    }
+                    continue;
+                }
+
+                try {
+                    serverTxCharacteristic.setValue(pending.bytes);
+                    notificationInFlight = true;
+                    inFlightNotificationAddress = pending.address;
+
+                    boolean initiated = gattServer.notifyCharacteristicChanged(
+                        pending.device,
+                        serverTxCharacteristic,
+                        false
+                    );
+
+                    if (initiated) return;
+
+                    notificationInFlight = false;
+                    inFlightNotificationAddress = null;
+                    notificationQueue.poll();
+
+                    if (!pending.settled) {
+                        pending.call.reject(
+                            "Android rejected the notification request."
+                        );
+                    }
+
+                } catch (SecurityException e) {
+                    notificationInFlight = false;
+                    inFlightNotificationAddress = null;
+                    notificationQueue.poll();
+
+                    if (!pending.settled) {
+                        pending.call.reject(
+                            "Bluetooth notification permission missing.", e
+                        );
+                    }
+
+                } catch (Exception e) {
+                    notificationInFlight = false;
+                    inFlightNotificationAddress = null;
+                    notificationQueue.poll();
+
+                    if (!pending.settled) {
+                        pending.call.reject(
+                            "Unable to send notification: " + e.getMessage(), e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    private void cleanupServerNotifications(String address) {
+        synchronized (notificationQueue) {
+            PendingNotification head = notificationQueue.peek();
+            Iterator<PendingNotification> iterator =
+                notificationQueue.iterator();
+
+            while (iterator.hasNext()) {
+                PendingNotification pending = iterator.next();
+
+                if (!pending.address.equals(address)) continue;
+
+                if (pending == head && notificationInFlight) {
+                    notificationInFlight = false;
+                    inFlightNotificationAddress = null;
+                }
+
+                iterator.remove();
+
+                if (!pending.settled) {
+                    pending.settled = true;
+                    pending.call.reject(
+                        "Peer disconnected or unsubscribed during notification."
+                    );
+                }
+            }
+        }
+
+        sendNextNotification();
+    }
+
+    private void rejectAllServerNotifications() {
+        synchronized (notificationQueue) {
+            for (PendingNotification pending : notificationQueue) {
+                if (!pending.settled) {
+                    pending.settled = true;
+                    pending.call.reject("GATT server stopped.");
+                }
+            }
+
+            notificationQueue.clear();
+            notificationInFlight = false;
+            inFlightNotificationAddress = null;
         }
     }
 

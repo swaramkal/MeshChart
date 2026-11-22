@@ -1,3 +1,5 @@
+import { PacketTransport } from './packet-transport.js';
+
 const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const RX_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 const TX_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
@@ -7,16 +9,19 @@ export class BluetoothAdapter {
     this.peers = new Map();
     this.listeners = new Set();
     this.incomingListeners = new Set();
+    this.disconnectListeners = new Set();
     this.device = null;
     this.server = null;
     this.characteristic = null;
-    this.messageHandler = null;
+    this.messageHandlers = new Set();
     this.native = null;
     this.nativeBound = false;
     this.advertising = false;
     this.advertisedName = '';
     this.scanning = false;
     this.roles = new Map();
+    this.packetTransport = new PacketTransport({ frameSize: 20 });
+    this.sendQueues = new Map();
   }
 
   getNative() {
@@ -31,6 +36,11 @@ export class BluetoothAdapter {
   onIncomingConnection(callback) {
     this.incomingListeners.add(callback);
     return () => this.incomingListeners.delete(callback);
+  }
+
+  onDisconnect(callback) {
+    this.disconnectListeners.add(callback);
+    return () => this.disconnectListeners.delete(callback);
   }
 
   getPeers() {
@@ -104,15 +114,23 @@ export class BluetoothAdapter {
 
       const peer = this.peers.get(id);
       if (peer) this.addPeer({ ...peer, connected: false });
+
+      for (const callback of this.disconnectListeners) {
+        callback(id);
+      }
     });
 
     await native.addListener('onPacketReceived', event => {
-      if (!event?.data) return;
+      if (!event?.dataBase64) return;
 
-      this.emitMessage(
-        event.data,
-        event.deviceId || event.senderId
-      );
+      const peerId = event.deviceId || event.senderId;
+      if (!peerId) return;
+
+      try {
+        this.receiveFrame(peerId, this.decodeBase64(event.dataBase64));
+      } catch (error) {
+        console.warn('MeshChat rejected an incoming BLE frame:', error);
+      }
     });
 
     await native.addListener('onScanError', event => {
@@ -167,6 +185,15 @@ export class BluetoothAdapter {
     device.addEventListener('gattserverdisconnected', () => {
       this.server = null;
       this.characteristic = null;
+
+      const currentPeer = this.peers.get(deviceId);
+      if (currentPeer) {
+        this.addPeer({ ...currentPeer, connected: false });
+      }
+
+      for (const callback of this.disconnectListeners) {
+        callback(deviceId);
+      }
     });
   }
 
@@ -214,52 +241,131 @@ export class BluetoothAdapter {
     this.characteristic.addEventListener(
       'characteristicvaluechanged',
       event => {
-        const bytes = new Uint8Array(event.target.value.buffer);
-        this.emitMessage(new TextDecoder().decode(bytes), deviceId);
+        const value = event.target.value;
+        const bytes = new Uint8Array(
+          value.buffer,
+          value.byteOffset,
+          value.byteLength
+        );
+        this.receiveFrame(deviceId, bytes);
       }
     );
 
     return true;
   }
 
+  encodeBase64(bytes) {
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary);
+  }
+
+  decodeBase64(value) {
+    if (typeof value !== 'string' || value.length > 64) {
+      throw new Error('Invalid BLE Base64 frame.');
+    }
+
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+
+    return bytes;
+  }
+
+  receiveFrame(peerId, frame) {
+    const packet = this.packetTransport.accept(peerId, frame);
+    if (!packet) return false;
+
+    const data = new TextDecoder('utf-8', { fatal: true }).decode(packet);
+    this.emitMessage(data, peerId);
+    return true;
+  }
+
   emitMessage(data, peerId) {
-    this.messageHandler?.({ data, peerId });
+    for (const callback of this.messageHandlers) {
+      try {
+        callback({ data, peerId });
+      } catch (error) {
+        console.error('MeshChat message listener failed:', error);
+      }
+    }
   }
 
   onMessage(callback) {
-    this.messageHandler = callback;
+    if (typeof callback !== 'function') {
+      throw new TypeError('Message listener must be a function.');
+    }
+
+    this.messageHandlers.add(callback);
+    return () => this.messageHandlers.delete(callback);
   }
 
   async send(data, deviceId) {
-    const native = this.getNative();
+    if (typeof data !== 'string' || !data.length) {
+      throw new Error('Message data must be a non-empty string.');
+    }
 
-    if (native) {
-      const role = this.roles.get(deviceId);
+    if (!deviceId) {
+      throw new Error('A destination peer is required.');
+    }
 
-      if (role === 'client') {
-        return native.writePacket({ deviceId, data });
+    const frames = this.packetTransport.fragment(data);
+    const previous = this.sendQueues.get(deviceId) || Promise.resolve();
+
+    const operation = previous.catch(() => {}).then(async () => {
+      const native = this.getNative();
+
+      if (native) {
+        const role = this.roles.get(deviceId);
+
+        if (role !== 'client' && role !== 'server') {
+          throw new Error('No active BLE connection role for this peer.');
+        }
+
+        const method = role === 'client'
+          ? native.writePacket
+          : native.notifyPacket;
+
+        if (typeof method !== 'function') {
+          throw new Error('Native BLE packet transport is unavailable.');
+        }
+
+        for (const frame of frames) {
+          await method.call(native, {
+            deviceId,
+            dataBase64: this.encodeBase64(frame)
+          });
+        }
+
+        return { fragmentsSent: frames.length };
       }
 
-      if (role === 'server') {
-        return native.notifyPacket({ deviceId, data });
+      if (!this.characteristic) {
+        throw new Error('No connected Bluetooth GATT characteristic.');
       }
 
-      throw new Error('No active BLE connection role for this peer.');
+      const service = this.characteristic.service;
+      const rx = await service.getCharacteristic(RX_UUID);
+
+      for (const frame of frames) {
+        await rx.writeValueWithResponse(frame);
+      }
+
+      return { fragmentsSent: frames.length };
+    });
+
+    this.sendQueues.set(deviceId, operation);
+
+    try {
+      return await operation;
+    } finally {
+      if (this.sendQueues.get(deviceId) === operation) {
+        this.sendQueues.delete(deviceId);
+      }
     }
-
-    if (!this.characteristic) {
-      throw new Error('No connected Bluetooth GATT characteristic.');
-    }
-
-    const service = this.characteristic.service;
-    const rx = await service.getCharacteristic(RX_UUID);
-    const bytes = new TextEncoder().encode(data);
-
-    if (bytes.length > 20) {
-      throw new Error('Browser BLE transport does not support fragmentation.');
-    }
-
-    await rx.writeValueWithResponse(bytes);
   }
 
   async stopScan() {

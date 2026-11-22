@@ -101,3 +101,33 @@
 .light .mobile-bottom-nav {
   background: rgba(247, 249, 253, .97);
 }
+
+
+/* MeshChat pairing verification UI */
+.pairing-modal { text-align: center; }
+.pairing-modal .modal-head { text-align: left; margin-bottom: 14px; }
+.pairing-modal p { margin: 10px 0; }
+.pairing-code-wrap {
+  margin-top: 20px;
+  padding: 20px 12px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: #17243a;
+}
+.pairing-code-label {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.4px;
+}
+.pairing-code {
+  margin: 12px 0;
+  color: var(--cyan);
+  font: 700 clamp(34px, 10vw, 48px)/1.2 'Space Grotesk', monospace;
+  letter-spacing: 7px;
+  font-variant-numeric: tabular-nums;
+}
+.pairing-warning { color: #ffd28a !important; font-size: 10px !important; }
+.pairing-modal .modal-actions { flex-wrap: wrap; }
+.pairing-modal button:disabled { opacity: .55; cursor: wait; }
+.light .pairing-code-wrap { background: #eef3fa; }
