@@ -1,6 +1,17 @@
 const MAGIC_1 = 0x4d;
 const MAGIC_2 = 0x43;
 const HEADER_SIZE = 8;
+const MAX_FRAME_SIZE = 255;
+
+function assertFrameSize(frameSize) {
+  if (
+    !Number.isInteger(frameSize) ||
+    frameSize <= HEADER_SIZE ||
+    frameSize > MAX_FRAME_SIZE
+  ) {
+    throw new Error('Invalid BLE frame size.');
+  }
+}
 
 export class PacketTransport {
   constructor({
@@ -9,10 +20,10 @@ export class PacketTransport {
     maxAssembliesPerPeer = 8,
     ttlMs = 30000
   } = {}) {
-    if (!Number.isInteger(frameSize) || frameSize <= HEADER_SIZE || frameSize > 255) {
-      throw new Error('Invalid BLE frame size.');
-    }
+    assertFrameSize(frameSize);
 
+    // frameSize is the default size used when sending. Incoming frames may be
+    // larger, up to the BLE maximum, because the sender negotiates its own MTU.
     this.frameSize = frameSize;
     this.payloadSize = frameSize - HEADER_SIZE;
     this.maxPacketBytes = maxPacketBytes;
@@ -21,7 +32,10 @@ export class PacketTransport {
     this.assemblies = new Map();
   }
 
-  fragment(input) {
+  fragment(input, frameSize = this.frameSize) {
+    assertFrameSize(frameSize);
+    const payloadSize = frameSize - HEADER_SIZE;
+
     const bytes = input instanceof Uint8Array
       ? input
       : new TextEncoder().encode(String(input));
@@ -30,7 +44,7 @@ export class PacketTransport {
       throw new Error('Packet is empty or exceeds the maximum size.');
     }
 
-    const total = Math.ceil(bytes.length / this.payloadSize);
+    const total = Math.ceil(bytes.length / payloadSize);
 
     if (total > 255) {
       throw new Error('Packet requires too many fragments.');
@@ -43,8 +57,8 @@ export class PacketTransport {
     const frames = [];
 
     for (let index = 0; index < total; index++) {
-      const start = index * this.payloadSize;
-      const payload = bytes.slice(start, start + this.payloadSize);
+      const start = index * payloadSize;
+      const payload = bytes.slice(start, start + payloadSize);
       const frame = new Uint8Array(HEADER_SIZE + payload.length);
 
       frame[0] = MAGIC_1;
@@ -72,7 +86,7 @@ export class PacketTransport {
 
     if (
       frame.length <= HEADER_SIZE ||
-      frame.length > this.frameSize ||
+      frame.length > MAX_FRAME_SIZE ||
       frame[0] !== MAGIC_1 ||
       frame[1] !== MAGIC_2
     ) {

@@ -49,6 +49,9 @@ export class ChatController {
     const store = this.db.transaction('messages', 'readwrite');
     const existing = await this.db.request(store.get(messageId));
     if (!existing) return null;
+    // 'delivered' is final: a fast receipt must not be overwritten by a
+    // late 'sent' or 'failed' update from the sending code path.
+    if (existing.status === 'delivered') return existing;
     const updated = { ...existing, status };
     await this.db.request(store.put(updated));
     return updated;

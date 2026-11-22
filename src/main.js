@@ -4,6 +4,7 @@ import { CryptoService } from './services/crypto.js';
 import { BluetoothAdapter } from './services/bluetooth.js';
 import { ChatController } from './services/chat.js';
 import { PairingController } from './services/pairing.js';
+import { sealPayload, openPacket } from './services/secure-channel.js';
 
 const $ = (selector) => document.querySelector(selector);
 const db = new MeshDatabase();
@@ -16,6 +17,10 @@ let onboardingRequired = false;
 let toastTimer;
 let activePairingPeerId = null;
 const pairingStates = new Map();
+let identityPromise = null;
+let lastPeerSignature = null;
+let peerRenderTimer = null;
+let peerListPressed = false;
 
 function toast(message) {
   const el = $('#toast');
@@ -26,7 +31,11 @@ function toast(message) {
 }
 
 
-function pairingStatusText(status) {
+function pairingStatusText(status, trusted = false) {
+  if (trusted && status === 'awaiting-confirmation') {
+    return 'Known contact recognised. Confirming automatically…';
+  }
+
   const messages = {
     negotiating: 'Establishing a secure connection…',
     'awaiting-confirmation': 'Compare the six-digit code on both phones. Confirm only if they match.',
@@ -57,7 +66,7 @@ function renderPairingState(state) {
   if (!dialog) return;
 
   $('#pairing-peer-name').textContent = state.peerName || 'Nearby device';
-  $('#pairing-status').textContent = pairingStatusText(state.status);
+  $('#pairing-status').textContent = pairingStatusText(state.status, state.trusted);
   $('#pairing-code').textContent = state.verificationCode || '------';
   $('#pairing-code-wrap').classList.toggle('hidden', !state.verificationCode);
 
@@ -68,48 +77,90 @@ function renderPairingState(state) {
   ].includes(state.status);
 
   $('#pairing-confirm').classList.toggle(
-    'hidden', state.status !== 'awaiting-confirmation'
+    'hidden', state.status !== 'awaiting-confirmation' || Boolean(state.trusted)
   );
   $('#pairing-cancel').textContent = terminal ? 'Close' : 'Cancel pairing';
 
   if (!dialog.open) dialog.showModal();
 }
 
-const pairing = new PairingController(bluetooth, {
-  onState: renderPairingState,
-  onSecure: (peerId) => {
-    toast('Secure pairing confirmed. Encrypted chat is ready.');
+// The device identity is created once and kept across restarts. Its private
+// key is non-extractable, so it cannot be exported from the app.
+function getLocalIdentity() {
+  identityPromise ||= (async () => {
+    let record = await db.getIdentity();
+
+    if (!record) {
+      record = await cryptoService.createSigningIdentity();
+      await db.saveIdentity(record);
+    }
+
+    return {
+      privateKey: record.privateKey,
+      publicKeySpki: record.publicKeySpki
+    };
+  })().catch((error) => {
+    identityPromise = null;
+    throw error;
+  });
+
+  return identityPromise;
+}
+
+// A contact is trusted once a pairing with its identity was confirmed.
+async function findTrustedContact(fingerprint) {
+  return chat.conversations.find((c) => c.fingerprint === fingerprint) || null;
+}
+
+async function handleSecured(peerId, session) {
+  try {
+    const previous = chat.conversations.find(
+      (c) => c.fingerprint === session.remoteFingerprint && c.peerId !== peerId
+    );
+
+    await db.saveConversation({
+      peerId,
+      peerName: session.peerName || 'Nearby MeshChat device',
+      fingerprint: session.remoteFingerprint,
+      connected: true
+    });
+
+    if (previous) {
+      // The contact came back from a new Bluetooth address: keep one thread.
+      await db.mergeConversation(previous.peerId, peerId);
+      if (chat.activePeerId === previous.peerId) chat.activePeerId = peerId;
+    }
+
+    await chat.load();
+    renderChatList();
+
     if (chat.activePeerId === peerId) {
       $('#conversation-status').textContent = 'Secure paired · encrypted chat';
+      await renderMessages();
     }
+  } catch (error) {
+    console.error('Unable to record the paired contact:', error);
   }
+
+  toast(
+    session.wasTrusted
+      ? 'Known contact reconnected securely.'
+      : 'Secure pairing confirmed. Encrypted chat is ready.'
+  );
+}
+
+const pairing = new PairingController(bluetooth, {
+  onState: renderPairingState,
+  onSecure: handleSecured,
+  getIdentity: getLocalIdentity,
+  findTrusted: findTrustedContact
 });
 
 // Encrypt every chat payload using the key established by verified pairing.
+// sealPayload adds a replay counter and binds the sender's role.
 async function sendSecurePayload(peerId, payload) {
   const session = pairing.getSecureSession(peerId);
-  if (!session || !session.sessionId || !session.encryptionKey) {
-    throw new Error('Secure pairing is required before sending messages.');
-  }
-
-  const additionalData = `MeshChat message v1:${session.sessionId}`;
-  const encrypted = await cryptoService.encrypt(
-    session.encryptionKey,
-    JSON.stringify(payload),
-    additionalData
-  );
-
-  const packet = JSON.stringify({
-    v: 1,
-    type: 'message',
-    sessionId: session.sessionId,
-    encrypted
-  });
-
-  if (new TextEncoder().encode(packet).length > 2900) {
-    throw new Error('Message is too large for the current Bluetooth transport.');
-  }
-
+  const packet = await sealPayload(cryptoService, session, payload);
   return bluetooth.send(packet, peerId);
 }
 
@@ -224,6 +275,16 @@ async function openConversation(peerId) {
 
 
 function renderPeers(peers) {
+  // Skip the DOM rebuild when nothing visible changed (scan results arrive
+  // many times per second) so a tap on "Connect" is never lost to a re-render.
+  const signature = peers
+    .map((p) => `${p.id}|${p.name}|${p.connected ? 1 : 0}`)
+    .sort()
+    .join(';');
+
+  if (signature === lastPeerSignature) return;
+  lastPeerSignature = signature;
+
   $('#peer-count').textContent =
     `${peers.length} device${peers.length === 1 ? '' : 's'}`;
 
@@ -235,41 +296,55 @@ function renderPeers(peers) {
           <strong>${escapeHTML(p.name)}</strong>
           <small>${escapeHTML(p.id)}</small>
         </div>
-        <span class="peer-signal">Nearby</span>
+        <span class="peer-signal">${p.connected ? 'Connected' : 'Nearby'}</span>
         <button class="secondary-button connect-peer"
           data-peer="${escapeHTML(p.id)}"
           data-name="${escapeHTML(p.name)}">Connect</button>
       </div>
     `).join('')
     : '<div class="empty-state">No devices discovered yet.</div>';
+}
 
-  document.querySelectorAll('.connect-peer').forEach((button) =>
-    button.addEventListener('click', async () => {
-      const peer = {
-        id: button.dataset.peer,
-        name: button.dataset.name
-      };
+function schedulePeerRender() {
+  clearTimeout(peerRenderTimer);
+  peerRenderTimer = setTimeout(() => {
+    // Hold the update while a finger is on the list.
+    if (peerListPressed) {
+      schedulePeerRender();
+      return;
+    }
+    renderPeers(bluetooth.getPeers());
+  }, 250);
+}
 
-      try {
-        await bluetooth.connect(peer.id);
-        await db.saveConversation({
-          peerId: peer.id,
-          peerName: peer.name,
-          connected: true
-        });
-        await chat.load();
+async function connectToPeer(button) {
+  const peer = {
+    id: button.dataset.peer,
+    name: button.dataset.name
+  };
 
-        activePairingPeerId = peer.id;
-        await pairing.start(peer.id, peer.name);
+  button.disabled = true;
 
-        renderChatList();
-        await openConversation(peer.id);
-        toast('Connected. Compare the verification codes on both phones.');
-      } catch (error) {
-        toast(error.message || 'Bluetooth connection failed.');
-      }
-    })
-  );
+  try {
+    await bluetooth.connect(peer.id);
+    await db.saveConversation({
+      peerId: peer.id,
+      peerName: peer.name,
+      connected: true
+    });
+    await chat.load();
+
+    activePairingPeerId = peer.id;
+    await pairing.start(peer.id, peer.name);
+
+    renderChatList();
+    await openConversation(peer.id);
+    toast('Connected. Securing the connection…');
+  } catch (error) {
+    toast(error.message || 'Bluetooth connection failed.');
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function refreshProfile() {
@@ -365,7 +440,19 @@ async function init() {
   $('#mobile-menu')?.addEventListener('click', () =>
     document.querySelector('.sidebar')?.classList.toggle('mobile-open')
   );
-  bluetooth.onPeer((peer) => renderPeers(bluetooth.getPeers()));
+  bluetooth.onPeer(() => schedulePeerRender());
+
+  const peerList = $('#peer-list');
+  peerList.addEventListener('pointerdown', () => { peerListPressed = true; });
+  const releasePeerList = () => {
+    setTimeout(() => { peerListPressed = false; }, 300);
+  };
+  peerList.addEventListener('pointerup', releasePeerList);
+  peerList.addEventListener('pointercancel', releasePeerList);
+  peerList.addEventListener('click', (event) => {
+    const button = event.target.closest('.connect-peer');
+    if (button) connectToPeer(button);
+  });
 
 
   $('#pairing-confirm').addEventListener('click', async () => {
@@ -422,28 +509,14 @@ async function init() {
     if (!data || !peerId) return;
 
     try {
-      let packet;
-      try {
-        packet = JSON.parse(data);
-      } catch {
-        return; // Never display legacy plaintext packets.
-      }
-
-      if (packet?.v !== 1 || packet.type !== 'message') return;
-
       const session = pairing.getSecureSession(peerId);
-      if (!session || packet.sessionId !== session.sessionId) return;
+      if (!session) return;
 
-      const additionalData = `MeshChat message v1:${session.sessionId}`;
-      const plaintext = await cryptoService.decrypt(
-        session.encryptionKey,
-        packet.encrypted,
-        additionalData
-      );
+      // Returns null for pairing traffic; throws on forged or replayed data.
+      const payload = await openPacket(cryptoService, session, data);
+      if (!payload) return;
 
-      const payload = JSON.parse(plaintext);
-
-      if (payload?.kind === 'ack' && typeof payload.id === 'string') {
+      if (payload.kind === 'ack' && typeof payload.id === 'string') {
         await chat.updateMessageStatus(payload.id, 'delivered');
         if (chat.activePeerId === peerId) await renderMessages();
         renderChatList();
@@ -451,7 +524,7 @@ async function init() {
       }
 
       if (
-        payload?.kind !== 'text' ||
+        payload.kind !== 'text' ||
         typeof payload.id !== 'string' ||
         typeof payload.text !== 'string' ||
         !payload.text.trim()
@@ -459,12 +532,11 @@ async function init() {
         return;
       }
 
-      let conversation = chat.getConversation(peerId);
-      if (!conversation) {
+      if (!chat.getConversation(peerId)) {
         const known = bluetooth.getPeers().find((p) => p.id === peerId);
         await db.saveConversation({
           peerId,
-          peerName: known?.name || 'Nearby MeshChat device',
+          peerName: known?.name || session.peerName || 'Nearby MeshChat device',
           connected: true
         });
         await chat.load();
@@ -485,7 +557,11 @@ async function init() {
     }
   });
 
-  if ('serviceWorker' in navigator && location.protocol !== 'file:')
+  // The Android app ships its files inside the APK; a service worker there
+  // only risks serving stale pages after an update.
+  const isNativeApp = Boolean(globalThis.Capacitor?.isNativePlatform?.());
+
+  if (!isNativeApp && 'serviceWorker' in navigator && location.protocol !== 'file:')
     navigator.serviceWorker
       .register(`${import.meta.env.BASE_URL}sw.js`)
       .catch(() => {});
@@ -540,8 +616,6 @@ async function sendMessage(event) {
   const message = await chat.addMessage(peerId, text, 'out', 'queued');
   $('#message-input').value = '';
 
-  // Set sent before transport so a fast encrypted acknowledgement cannot be overwritten.
-  await chat.updateMessageStatus(message.id, 'sent');
   await renderMessages();
   renderChatList();
 
@@ -551,6 +625,10 @@ async function sendMessage(event) {
       id: String(message.id),
       text
     });
+
+    // 'delivered' is final, so a receipt that already arrived is kept.
+    await chat.updateMessageStatus(message.id, 'sent');
+    await renderMessages();
     toast('Encrypted message sent. Waiting for receipt…');
   } catch (error) {
     console.error('Encrypted BLE send failed:', error);
@@ -592,6 +670,9 @@ async function clearData() {
   if (!confirm('Delete all MeshChat local data from this device? This cannot be undone.'))
     return;
   await db.clear();
+  pairing.reset();
+  identityPromise = null;
+  lastPeerSignature = null;
   await chat.load();
   chat.activePeerId = null;
   $('#conversation-panel').classList.add('hidden');

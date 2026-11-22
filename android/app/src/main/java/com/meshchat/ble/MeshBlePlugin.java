@@ -1337,6 +1337,31 @@ public class MeshBlePlugin extends Plugin {
         }
     }
 
+    // Reports the largest payload the link can carry for a peer so the JS
+    // layer can size its frames instead of always using 20 bytes.
+    // role: "server" for peers that connected to us, otherwise "client".
+    @PluginMethod
+    public void getMtu(PluginCall call) {
+        String address = call.getString("deviceId");
+
+        if (address == null || address.isEmpty()) {
+            call.reject("Missing deviceId.");
+            return;
+        }
+
+        boolean server = "server".equals(call.getString("role"));
+        Integer negotiated = server
+            ? serverNegotiatedMtus.get(address)
+            : negotiatedMtus.get(address);
+
+        int mtu = negotiated != null ? negotiated : 23;
+
+        JSObject result = new JSObject();
+        result.put("mtu", mtu);
+        result.put("maxPayload", Math.max(20, mtu - 3));
+        call.resolve(result);
+    }
+
     @PluginMethod
     public void notifyPacket(PluginCall call) {
         String address = call.getString("deviceId");

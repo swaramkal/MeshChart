@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PairingController } from '../src/services/pairing.js';
+import { CryptoService } from '../src/services/crypto.js';
+
+async function makeIdentity() {
+  const identity = await new CryptoService().createSigningIdentity();
+  return { privateKey: identity.privateKey, publicKeySpki: identity.publicKeySpki };
+}
 
 class FakeBluetooth {
   constructor(id) {
@@ -55,12 +61,17 @@ test('two devices derive the same code and establish only after both confirmatio
   const statesA = [];
   const statesB = [];
 
+  const identityA = await makeIdentity();
+  const identityB = await makeIdentity();
+
   const pairingA = new PairingController(a, {
-    onState: state => statesA.push(state)
+    onState: state => statesA.push(state),
+    getIdentity: async () => identityA
   });
 
   const pairingB = new PairingController(b, {
-    onState: state => statesB.push(state)
+    onState: state => statesB.push(state),
+    getIdentity: async () => identityB
   });
 
   try {

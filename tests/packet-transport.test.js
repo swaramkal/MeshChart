@@ -80,9 +80,9 @@ test('isolates assemblies belonging to different peers', () => {
   assert.equal(transport.assemblies.size, 2);
 });
 
-test('rejects frames larger than the configured BLE frame size', () => {
+test('rejects frames larger than the BLE maximum', () => {
   const transport = new PacketTransport();
-  const oversized = new Uint8Array(21);
+  const oversized = new Uint8Array(256);
   oversized[0] = 0x4d;
   oversized[1] = 0x43;
 
@@ -90,4 +90,37 @@ test('rejects frames larger than the configured BLE frame size', () => {
     () => transport.accept('peer-a', oversized),
     /Invalid BLE frame/
   );
+});
+
+test('uses the negotiated MTU for larger frames and still reassembles', () => {
+  const sender = new PacketTransport();
+  const receiver = new PacketTransport();
+  const original = 'negotiated MTU payload '.repeat(100);
+
+  const small = sender.fragment(original);
+  const large = sender.fragment(original, 244);
+
+  assert.ok(large.length < small.length / 10);
+  assert.ok(large.every(frame => frame.length <= 244));
+
+  let result = null;
+  for (const frame of large) {
+    result = receiver.accept('peer-a', frame) || result;
+  }
+
+  assert.equal(decoder.decode(result), original);
+});
+
+test('rejects an invalid per-call frame size', () => {
+  const transport = new PacketTransport();
+
+  assert.throws(() => transport.fragment('hello', 8), /Invalid BLE frame size/);
+  assert.throws(() => transport.fragment('hello', 300), /Invalid BLE frame size/);
+});
+
+test('a 2.9 KB packet needs about a dozen frames at the 247-byte MTU', () => {
+  const transport = new PacketTransport();
+  const frames = transport.fragment('x'.repeat(2900), 244);
+
+  assert.ok(frames.length <= 13);
 });

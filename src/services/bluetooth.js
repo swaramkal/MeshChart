@@ -4,6 +4,10 @@ const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const RX_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 const TX_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
+// Smallest frame that fits the default 23-byte ATT MTU (23 - 3 header bytes).
+const DEFAULT_FRAME_SIZE = 20;
+const MAX_FRAME_SIZE = 255;
+
 export class BluetoothAdapter {
   constructor() {
     this.peers = new Map();
@@ -20,8 +24,9 @@ export class BluetoothAdapter {
     this.advertisedName = '';
     this.scanning = false;
     this.roles = new Map();
-    this.packetTransport = new PacketTransport({ frameSize: 20 });
+    this.packetTransport = new PacketTransport({ frameSize: DEFAULT_FRAME_SIZE });
     this.sendQueues = new Map();
+    this.frameSizes = new Map();
   }
 
   getNative() {
@@ -111,6 +116,7 @@ export class BluetoothAdapter {
       if (!id) return;
 
       this.roles.delete(id);
+      this.frameSizes.delete(id);
 
       const peer = this.peers.get(id);
       if (peer) this.addPeer({ ...peer, connected: false });
@@ -181,6 +187,8 @@ export class BluetoothAdapter {
       name: device.name || 'MeshChat device',
       device
     });
+
+    const deviceId = device.id;
 
     device.addEventListener('gattserverdisconnected', () => {
       this.server = null;
@@ -261,7 +269,8 @@ export class BluetoothAdapter {
   }
 
   decodeBase64(value) {
-    if (typeof value !== 'string' || value.length > 64) {
+    // 255-byte frames encode to 340 Base64 characters.
+    if (typeof value !== 'string' || value.length > 400) {
       throw new Error('Invalid BLE Base64 frame.');
     }
 
@@ -303,6 +312,34 @@ export class BluetoothAdapter {
     return () => this.messageHandlers.delete(callback);
   }
 
+  // Largest frame the native link can carry for this peer. Falls back to the
+  // 20-byte default if the plugin cannot report the negotiated MTU.
+  async getFrameSize(native, deviceId, role) {
+    const cached = this.frameSizes.get(deviceId);
+    if (cached) return cached;
+
+    let size = DEFAULT_FRAME_SIZE;
+
+    try {
+      if (typeof native.getMtu === 'function') {
+        const result = await native.getMtu({ deviceId, role });
+        const payload = Number(result?.maxPayload);
+
+        if (Number.isInteger(payload)) {
+          size = Math.min(MAX_FRAME_SIZE, Math.max(DEFAULT_FRAME_SIZE, payload));
+        }
+      }
+    } catch (error) {
+      console.warn('MeshChat could not read the BLE MTU:', error);
+    }
+
+    // The server-side MTU can still be settling right after connection, so
+    // only cache once a larger size has been confirmed.
+    if (size > DEFAULT_FRAME_SIZE) this.frameSizes.set(deviceId, size);
+
+    return size;
+  }
+
   async send(data, deviceId) {
     if (typeof data !== 'string' || !data.length) {
       throw new Error('Message data must be a non-empty string.');
@@ -312,7 +349,9 @@ export class BluetoothAdapter {
       throw new Error('A destination peer is required.');
     }
 
-    const frames = this.packetTransport.fragment(data);
+    // Validate size up front so callers get an immediate error.
+    this.packetTransport.fragment(data);
+
     const previous = this.sendQueues.get(deviceId) || Promise.resolve();
 
     const operation = previous.catch(() => {}).then(async () => {
@@ -328,6 +367,11 @@ export class BluetoothAdapter {
         const method = role === 'client'
           ? native.writePacket
           : native.notifyPacket;
+
+        const frames = this.packetTransport.fragment(
+          data,
+          await this.getFrameSize(native, deviceId, role)
+        );
 
         if (typeof method !== 'function') {
           throw new Error('Native BLE packet transport is unavailable.');
@@ -347,6 +391,7 @@ export class BluetoothAdapter {
         throw new Error('No connected Bluetooth GATT characteristic.');
       }
 
+      const frames = this.packetTransport.fragment(data);
       const service = this.characteristic.service;
       const rx = await service.getCharacteristic(RX_UUID);
 

@@ -4,6 +4,13 @@ const decoder = new TextDecoder();
 const PROTOCOL_INFO = encoder.encode('MeshChat Secure Pairing v1');
 const CONFIRM_PREFIX = 'MeshChat pairing confirmation v1';
 const SAS_PREFIX = 'MeshChat verification code v1';
+const IDENTITY_SIGNATURE_PREFIX = 'MeshChat identity confirmation v2';
+
+// Groups a hex fingerprint for display, e.g. "a1b2 c3d4 e5f6 ...".
+export function formatFingerprint(fingerprint, groups = 8) {
+  if (typeof fingerprint !== 'string') return '';
+  return (fingerprint.match(/.{1,4}/g) || []).slice(0, groups).join(' ');
+}
 
 export class CryptoService {
   constructor() {
@@ -277,6 +284,101 @@ export class CryptoService {
     );
 
     return decoder.decode(plaintext);
+  }
+
+  // ---- Long-term device identity (ECDSA P-256) ----------------------------
+  // The identity key survives restarts and Bluetooth address changes. It is
+  // used to sign each pairing transcript so a known contact can be recognised
+  // without comparing a code again. The private key is non-extractable.
+
+  async createSigningIdentity() {
+    if (!this.supported()) {
+      throw new Error(
+        'Web Crypto is unavailable. Use HTTPS or the Android application.'
+      );
+    }
+
+    const pair = await crypto.subtle.generateKey(
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      false,
+      ['sign', 'verify']
+    );
+
+    const spki = await crypto.subtle.exportKey('spki', pair.publicKey);
+
+    return {
+      privateKey: pair.privateKey,
+      publicKey: pair.publicKey,
+      publicKeySpki: this.toBase64(spki)
+    };
+  }
+
+  async fingerprintOf(publicKeySpki) {
+    const bytes = this.fromBase64(publicKeySpki);
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+
+    return [...new Uint8Array(digest)]
+      .map(value => value.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  identityMessage(role, transcriptHash) {
+    if (!['initiator', 'responder'].includes(role)) {
+      throw new Error('Invalid pairing role.');
+    }
+
+    if (typeof transcriptHash !== 'string' || transcriptHash.length > 256) {
+      throw new Error('Invalid transcript hash.');
+    }
+
+    return encoder.encode(
+      `${IDENTITY_SIGNATURE_PREFIX}|${role}|${transcriptHash}`
+    );
+  }
+
+  async signIdentityConfirmation(privateKey, role, transcriptHash) {
+    const signature = await crypto.subtle.sign(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      privateKey,
+      this.identityMessage(role, transcriptHash)
+    );
+
+    return this.toBase64(signature);
+  }
+
+  async verifyIdentityConfirmation(
+    publicKeySpki,
+    role,
+    transcriptHash,
+    encodedSignature
+  ) {
+    try {
+      if (
+        typeof publicKeySpki !== 'string' ||
+        publicKeySpki.length > 512 ||
+        typeof encodedSignature !== 'string' ||
+        encodedSignature.length > 256
+      ) {
+        return false;
+      }
+
+      const publicKey = await crypto.subtle.importKey(
+        'spki',
+        this.fromBase64(publicKeySpki),
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        false,
+        ['verify']
+      );
+
+      return await crypto.subtle.verify(
+        { name: 'ECDSA', hash: 'SHA-256' },
+        publicKey,
+        this.fromBase64(encodedSignature),
+        this.identityMessage(role, transcriptHash)
+      );
+    } catch {
+      return false;
+    }
   }
 
   clearIdentity() {

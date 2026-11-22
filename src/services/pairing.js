@@ -1,8 +1,13 @@
 import { CryptoService } from './crypto.js';
 
-const VERSION = 1;
+// Protocol v2: every pairing is bound to each device's long-term identity key.
+// The first pairing with a device needs a human-verified code. After that the
+// identity is pinned, so a reconnect from a new Bluetooth address is
+// recognised cryptographically and confirmed without comparing a code again.
+const VERSION = 2;
 const TIMEOUT_MS = 60000;
 const MAX_PACKET_LENGTH = 3000;
+const MAX_IDENTITY_KEY_LENGTH = 512;
 
 function randomHex(bytes = 16) {
   const data = crypto.getRandomValues(new Uint8Array(bytes));
@@ -15,22 +20,44 @@ function validHex(value, length = 32) {
     /^[0-9a-f]+$/i.test(value);
 }
 
+function validIdentityKey(value) {
+  return typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= MAX_IDENTITY_KEY_LENGTH;
+}
+
 function makeTranscript(session) {
   return JSON.stringify([
-    'MeshChat Pairing v1',
+    'MeshChat Pairing v2',
     session.sessionId,
     session.initiatorPublicKey,
     session.initiatorNonce,
     session.responderPublicKey,
-    session.responderNonce
+    session.responderNonce,
+    session.initiatorIdentityKey,
+    session.responderIdentityKey
   ]);
 }
 
 export class PairingController {
-  constructor(bluetooth, { onState = () => {}, onSecure = () => {} } = {}) {
+  constructor(
+    bluetooth,
+    {
+      onState = () => {},
+      onSecure = () => {},
+      getIdentity,
+      findTrusted = async () => null
+    } = {}
+  ) {
+    if (typeof getIdentity !== 'function') {
+      throw new Error('A local identity provider is required for pairing.');
+    }
+
     this.bluetooth = bluetooth;
     this.onState = onState;
     this.onSecure = onSecure;
+    this.getIdentity = getIdentity;
+    this.findTrusted = findTrusted;
     this.sessions = new Map();
     this.secureSessions = new Map();
 
@@ -57,6 +84,7 @@ export class PairingController {
       peerName: session.peerName,
       role: session.role,
       status,
+      trusted: Boolean(session.trusted),
       verificationCode: session.material?.verificationCode || null
     });
   }
@@ -102,6 +130,7 @@ export class PairingController {
       material: null,
       localConfirmed: false,
       remoteConfirmed: false,
+      trusted: false,
       timer: null
     };
 
@@ -111,12 +140,14 @@ export class PairingController {
 
     try {
       const identity = await session.crypto.createIdentity();
+      const local = await this.getIdentity();
 
       if (!this.isCurrent(session)) {
         session.crypto.clearIdentity();
         return false;
       }
 
+      session.identity = local;
       session.localPublicKey = identity.publicKey;
 
       await this.send(peerId, {
@@ -124,7 +155,8 @@ export class PairingController {
         type: 'hello',
         sessionId: session.sessionId,
         nonce: session.localNonce,
-        publicKey: identity.publicKey
+        publicKey: identity.publicKey,
+        identityKey: local.publicKeySpki
       });
     } catch (error) {
       if (this.isCurrent(session)) {
@@ -181,7 +213,8 @@ export class PairingController {
       !validHex(packet.sessionId) ||
       !validHex(packet.nonce) ||
       typeof packet.publicKey !== 'string' ||
-      packet.publicKey.length > 4096
+      packet.publicKey.length > 4096 ||
+      !validIdentityKey(packet.identityKey)
     ) {
       return;
     }
@@ -207,10 +240,12 @@ export class PairingController {
       sessionId: packet.sessionId,
       remoteNonce: packet.nonce,
       remotePublicKey: packet.publicKey,
+      remoteIdentityKey: packet.identityKey,
       crypto: new CryptoService(),
       material: null,
       localConfirmed: false,
       remoteConfirmed: false,
+      trusted: false,
       timer: null
     };
 
@@ -220,19 +255,27 @@ export class PairingController {
 
     try {
       const identity = await session.crypto.createIdentity();
+      const local = await this.getIdentity();
 
       if (!this.isCurrent(session)) {
         session.crypto.clearIdentity();
         return;
       }
 
+      if (local.publicKeySpki === packet.identityKey) {
+        throw new Error('Refusing to pair a device with itself.');
+      }
+
+      session.identity = local;
       session.localPublicKey = identity.publicKey;
       session.localNonce = randomHex();
 
       session.initiatorPublicKey = packet.publicKey;
       session.initiatorNonce = packet.nonce;
+      session.initiatorIdentityKey = packet.identityKey;
       session.responderPublicKey = identity.publicKey;
       session.responderNonce = session.localNonce;
+      session.responderIdentityKey = local.publicKeySpki;
 
       session.material = await session.crypto.derivePairingMaterial(
         packet.publicKey,
@@ -249,10 +292,11 @@ export class PairingController {
         type: 'ack',
         sessionId: session.sessionId,
         nonce: session.localNonce,
-        publicKey: identity.publicKey
+        publicKey: identity.publicKey,
+        identityKey: local.publicKeySpki
       });
 
-      this.publish(session, 'awaiting-confirmation');
+      await this.materialReady(session);
     } catch (error) {
       if (this.isCurrent(session)) {
         this.cancel(peerId, 'failed', true);
@@ -265,18 +309,29 @@ export class PairingController {
     if (
       session.role !== 'initiator' ||
       session.material ||
+      session.ackReceived ||
       !validHex(packet.nonce) ||
       typeof packet.publicKey !== 'string' ||
-      packet.publicKey.length > 4096
+      packet.publicKey.length > 4096 ||
+      !validIdentityKey(packet.identityKey)
     ) {
       return;
     }
 
+    session.ackReceived = true;
+
     try {
+      if (session.identity.publicKeySpki === packet.identityKey) {
+        throw new Error('Refusing to pair a device with itself.');
+      }
+
+      session.remoteIdentityKey = packet.identityKey;
       session.initiatorPublicKey = session.localPublicKey;
       session.initiatorNonce = session.localNonce;
+      session.initiatorIdentityKey = session.identity.publicKeySpki;
       session.responderPublicKey = packet.publicKey;
       session.responderNonce = packet.nonce;
+      session.responderIdentityKey = packet.identityKey;
 
       session.material = await session.crypto.derivePairingMaterial(
         packet.publicKey,
@@ -288,12 +343,40 @@ export class PairingController {
         return;
       }
 
-      this.publish(session, 'awaiting-confirmation');
+      await this.materialReady(session);
     } catch (error) {
       if (this.isCurrent(session)) {
         this.cancel(session.peerId, 'failed', true);
       }
       throw error;
+    }
+  }
+
+  // Called once both sides' keys are known. Looks the remote identity up in
+  // the pinned contacts, processes any confirmation that arrived early, and
+  // confirms automatically for a recognised contact.
+  async materialReady(session) {
+    session.remoteFingerprint =
+      await session.crypto.fingerprintOf(session.remoteIdentityKey);
+
+    const contact = await this.findTrusted(session.remoteFingerprint);
+
+    if (!this.isCurrent(session)) return;
+
+    session.trusted = Boolean(contact);
+    this.publish(session, 'awaiting-confirmation');
+
+    // The peer may confirm before our own key derivation finished, because
+    // BLE packets are handled concurrently.
+    if (session.pendingConfirmation) {
+      const early = session.pendingConfirmation;
+      session.pendingConfirmation = null;
+      await this.receiveConfirmation(session, early);
+      if (!this.isCurrent(session)) return;
+    }
+
+    if (session.trusted) {
+      await this.confirmLocal(session.peerId);
     }
   }
 
@@ -316,6 +399,12 @@ export class PairingController {
         session.material.transcriptHash
       );
 
+      const signature = await session.crypto.signIdentityConfirmation(
+        session.identity.privateKey,
+        session.role,
+        session.material.transcriptHash
+      );
+
       if (!this.isCurrent(session)) return;
 
       await this.send(peerId, {
@@ -323,7 +412,8 @@ export class PairingController {
         type: 'confirm',
         sessionId: session.sessionId,
         role: session.role,
-        mac
+        mac,
+        signature
       });
 
       if (!this.isCurrent(session)) return;
@@ -341,24 +431,37 @@ export class PairingController {
 
   async receiveConfirmation(session, packet) {
     if (
-      !session.material ||
       !['initiator', 'responder'].includes(packet.role) ||
       packet.role === session.role ||
-      typeof packet.mac !== 'string'
+      typeof packet.mac !== 'string' ||
+      typeof packet.signature !== 'string'
     ) {
       return;
     }
 
-    const valid = await session.crypto.verifyConfirmationMac(
+    if (!session.material) {
+      session.pendingConfirmation = packet;
+      return;
+    }
+
+    const macValid = await session.crypto.verifyConfirmationMac(
       session.material.confirmationKey,
       packet.role,
       session.material.transcriptHash,
       packet.mac
     );
 
+    const identityValid = macValid &&
+      await session.crypto.verifyIdentityConfirmation(
+        session.remoteIdentityKey,
+        packet.role,
+        session.material.transcriptHash,
+        packet.signature
+      );
+
     if (!this.isCurrent(session)) return;
 
-    if (!valid) {
+    if (!macValid || !identityValid) {
       this.cancel(session.peerId, 'verification-failed', true);
       return;
     }
@@ -375,9 +478,15 @@ export class PairingController {
 
     const secureSession = {
       sessionId: session.sessionId,
+      role: session.role,
       encryptionKey: session.material.encryptionKey,
+      remoteFingerprint: session.remoteFingerprint,
+      wasTrusted: session.trusted,
       establishedAt: Date.now(),
-      peerName: session.peerName
+      peerName: session.peerName,
+      sendCounter: 0,
+      receiveHighest: 0,
+      receiveSeen: new Set()
     };
 
     this.secureSessions.set(session.peerId, secureSession);
@@ -389,10 +498,11 @@ export class PairingController {
       peerName: session.peerName,
       role: session.role,
       status: 'secure',
+      trusted: session.trusted,
       verificationCode: session.material.verificationCode
     });
 
-    this.onSecure(session.peerId, secureSession);
+    await this.onSecure(session.peerId, secureSession);
   }
 
   discard(session) {
@@ -404,8 +514,9 @@ export class PairingController {
     }
   }
 
-  cancel(peerId, reason = 'cancelled', notifyPeer = true) {
+  cancel(peerId, status = 'cancelled', notifyPeer = true) {
     const session = this.sessions.get(peerId);
+    const hadSecure = this.secureSessions.has(peerId);
 
     if (session) {
       if (notifyPeer) {
@@ -421,11 +532,10 @@ export class PairingController {
 
     this.secureSessions.delete(peerId);
 
-    this.onState({
-      peerId,
-      status: reason,
-      verificationCode: null
-    });
+    // Do not raise pairing UI for a Bluetooth peer that was never pairing.
+    if (session || hadSecure) {
+      this.onState({ peerId, status, trusted: false, verificationCode: null });
+    }
   }
 
   getSecureSession(peerId) {
@@ -436,16 +546,23 @@ export class PairingController {
     return this.secureSessions.has(peerId);
   }
 
+  // Forget every session, e.g. after the user clears local data.
+  reset() {
+    for (const peerId of [...this.sessions.keys()]) {
+      this.cancel(peerId, 'destroyed', true);
+    }
+
+    this.secureSessions.clear();
+  }
+
   destroy() {
     this.removeMessageListener?.();
     this.removeDisconnectListener?.();
 
-    for (const peerId of this.sessions.keys()) {
+    for (const peerId of [...this.sessions.keys()]) {
       this.cancel(peerId, 'destroyed', false);
     }
 
-    for (const peerId of this.secureSessions.keys()) {
-      this.secureSessions.delete(peerId);
-    }
+    this.secureSessions.clear();
   }
 }
