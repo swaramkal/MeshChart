@@ -5,6 +5,17 @@ import { BluetoothAdapter } from './services/bluetooth.js';
 import { ChatController } from './services/chat.js';
 import { PairingController } from './services/pairing.js';
 import { sealPayload, openPacket } from './services/secure-channel.js';
+import {
+  formatListTime,
+  formatClock,
+  groupMessagesByDay,
+  tickFor,
+  previewText,
+  avatarHue,
+  filterConversations,
+  totalUnread,
+  unreadLabel
+} from './ui/chat-format.js';
 
 const $ = (selector) => document.querySelector(selector);
 const db = new MeshDatabase();
@@ -21,6 +32,7 @@ let identityPromise = null;
 let lastPeerSignature = null;
 let peerRenderTimer = null;
 let peerListPressed = false;
+let chatQuery = '';
 
 function toast(message) {
   const el = $('#toast');
@@ -184,68 +196,117 @@ function setView(view) {
     el.classList.toggle('active', el.dataset.view === view)
   );
   document.querySelector('.sidebar')?.classList.remove('mobile-open');
+  syncChatMode();
 }
 
+// On phones an open conversation fills the screen, like WhatsApp.
+function syncChatMode() {
+  document.body.classList.toggle(
+    'in-chat',
+    activeView === 'chats' && Boolean(chat.activePeerId)
+  );
+}
+
+function avatarHTML(name, extraClass = '') {
+  return `<span class="avatar ${extraClass}" style="background:hsl(${avatarHue(name)} 42% 38%)">${escapeHTML(initials(name))}</span>`;
+}
+
+
+function chatRowHTML(c) {
+  const unread = Number(c.unread) || 0;
+  const tick = c.lastDirection === 'out' && c.lastMessage
+    ? `<span class="tick ${tickFor(c.lastStatus).className}">${tickFor(c.lastStatus).symbol}</span>`
+    : '';
+
+  return `
+    <button class="chat-item ${chat.activePeerId === c.peerId ? 'selected' : ''} ${unread ? 'has-unread' : ''}"
+      data-peer="${escapeHTML(c.peerId)}">
+      ${avatarHTML(c.peerName)}
+      ${c.connected ? '<span class="online-dot" title="Connected"></span>' : ''}
+      <span class="chat-item-main">
+        <span class="chat-item-top">
+          <strong>${escapeHTML(c.peerName)}</strong>
+          <small class="chat-time">${escapeHTML(formatListTime(c.updatedAt))}</small>
+        </span>
+        <span class="chat-item-bottom">
+          <small class="chat-preview">${tick}${escapeHTML(previewText(c))}</small>
+          ${unread ? `<span class="unread-badge">${unreadLabel(unread)}</span>` : ''}
+        </span>
+      </span>
+    </button>
+  `;
+}
 
 function renderChatList() {
   const chats = chat.getConversations();
+  const filtered = filterConversations(chats, chatQuery);
+  const unread = totalUnread(chats);
+
   $('#chat-count').textContent = String(chats.length);
+  $('#home-chat-count').textContent = unread
+    ? `${unread} unread`
+    : `${chats.length} chat${chats.length === 1 ? '' : 's'}`;
 
-  const query = $('#chat-search').value.trim().toLowerCase();
-  const filtered = chats.filter((c) =>
-    String(c.peerName || '').toLowerCase().includes(query)
+  const html = filtered.length
+    ? filtered.map(chatRowHTML).join('')
+    : `<div class="empty-small">${
+        chats.length ? 'No chats match your search.' : 'No conversations yet.'
+      }</div>`;
+
+  $('#chat-list').innerHTML = html;
+  $('#home-chat-list').innerHTML = html;
+
+  // Total unread on the Chats tab.
+  document.querySelectorAll('.nav-link[data-view="chats"]').forEach((el) => {
+    let badge = el.querySelector('.nav-badge');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'nav-badge';
+      el.appendChild(badge);
+    }
+    badge.textContent = unreadLabel(unread);
+    badge.hidden = unread === 0;
+  });
+
+  // Phones show the chat list as the home screen until a chat is opened.
+  $('#chat-home').classList.toggle(
+    'hidden',
+    chats.length === 0 || Boolean(chat.activePeerId)
   );
 
-  $('#chat-list').innerHTML = filtered.length
-    ? filtered.map((c) => `
-      <button class="chat-item ${chat.activePeerId === c.peerId ? 'selected' : ''}"
-        data-peer="${escapeHTML(c.peerId)}">
-        <span class="avatar">${escapeHTML(initials(c.peerName))}</span>
-        <span class="chat-item-copy">
-          <strong>${escapeHTML(c.peerName)}</strong>
-          <small>${escapeHTML(c.lastMessage || 'Start a conversation')}</small>
-        </span>
-        <small class="chat-time">${
-          c.updatedAt
-            ? new Date(c.updatedAt).toLocaleTimeString([], {
-                hour: '2-digit', minute: '2-digit'
-              })
-            : ''
-        }</small>
-      </button>
-    `).join('')
-    : '<div class="empty-small">No conversations found.</div>';
-
-  document.querySelectorAll('.chat-item').forEach((el) =>
-    el.addEventListener('click', () => openConversation(el.dataset.peer))
-  );
+  syncChatMode();
 }
 
+
+function messageHTML(m) {
+  const outgoing = m.direction === 'out';
+  const tick = tickFor(m.status);
+
+  return `
+    <div class="message-row ${outgoing ? 'outgoing' : 'incoming'}">
+      <div class="message-bubble">
+        <span class="message-text">${escapeHTML(m.text)}</span>
+        <small class="message-meta">${formatClock(m.createdAt)}${
+          outgoing
+            ? ` <span class="tick ${tick.className}" aria-label="${tick.label}">${tick.symbol}</span>`
+            : ''
+        }</small>
+      </div>
+    </div>
+  `;
+}
 
 async function renderMessages() {
   const peerId = chat.activePeerId;
   if (!peerId) return;
 
   const messages = await chat.getMessages(peerId);
-  const statusLabel = (status) => {
-    if (status === 'delivered') return ' · delivered';
-    if (status === 'sent') return ' · sent';
-    if (status === 'failed') return ' · failed';
-    if (status === 'queued') return ' · sending';
-    return '';
-  };
 
   $('#message-list').innerHTML = messages.length
-    ? messages.map((m) => `
-      <div class="message-row ${m.direction === 'out' ? 'outgoing' : 'incoming'}">
-        <div class="message-bubble">
-          ${escapeHTML(m.text)}
-          <small>${new Date(m.createdAt).toLocaleTimeString([], {
-            hour: '2-digit', minute: '2-digit'
-          })}${statusLabel(m.status)}</small>
-        </div>
-      </div>
-    `).join('')
+    ? groupMessagesByDay(messages).map((group) => `
+        <div class="day-separator"><span>${escapeHTML(group.label)}</span></div>
+        ${group.messages.map(messageHTML).join('')}
+      `).join('')
     : '<div class="conversation-empty">This is the beginning of your conversation.</div>';
 
   $('#message-list').scrollTop = $('#message-list').scrollHeight;
@@ -261,6 +322,8 @@ async function openConversation(peerId) {
   $('#conversation-panel').classList.remove('hidden');
   $('#conversation-name').textContent = conversation.peerName;
   $('#conversation-avatar').textContent = initials(conversation.peerName);
+  $('#conversation-avatar').style.background =
+    `hsl(${avatarHue(conversation.peerName)} 42% 38%)`;
 
   $('#conversation-status').textContent = pairing.isSecure(peerId)
     ? 'Secure paired · encrypted chat'
@@ -268,9 +331,32 @@ async function openConversation(peerId) {
       ? 'Connected nearby · pairing required'
       : 'Saved conversation · not connected';
 
+  await chat.markRead(peerId);
   await renderMessages();
   renderChatList();
   setView('chats');
+}
+
+function closeConversation() {
+  chat.activePeerId = null;
+  $('#conversation-panel').classList.add('hidden');
+  $('#welcome-panel').classList.remove('hidden');
+  renderChatList();
+}
+
+async function deleteActiveChat() {
+  const peerId = chat.activePeerId;
+  const conversation = chat.getConversation(peerId);
+  if (!conversation) return;
+
+  const ok = window.confirm(
+    `Delete the chat with ${conversation.peerName}? All its messages on this phone will be removed.`
+  );
+  if (!ok) return;
+
+  await chat.deleteConversation(peerId);
+  closeConversation();
+  toast('Chat deleted.');
 }
 
 
@@ -407,7 +493,33 @@ async function init() {
   $('#profile-dialog').addEventListener('cancel', (event) => {
     if (onboardingRequired) event.preventDefault();
   });
-  $('#chat-search').addEventListener('input', renderChatList);
+  const syncSearch = (value) => {
+    chatQuery = value;
+    $('#chat-search').value = value;
+    $('#home-search').value = value;
+    renderChatList();
+  };
+  $('#chat-search').addEventListener('input', (e) => syncSearch(e.target.value));
+  $('#home-search').addEventListener('input', (e) => syncSearch(e.target.value));
+
+  // One delegated handler per list, so re-rendering never loses a tap.
+  for (const list of [$('#chat-list'), $('#home-chat-list')]) {
+    list.addEventListener('click', (event) => {
+      const row = event.target.closest('.chat-item');
+      if (row) openConversation(row.dataset.peer);
+    });
+  }
+
+  $('#delete-chat').addEventListener('click', deleteActiveChat);
+
+  // Messages that arrive while the app is in the background stay unread.
+  chat.isVisible = () => !document.hidden && activeView === 'chats';
+  document.addEventListener('visibilitychange', async () => {
+    if (!document.hidden && chat.activePeerId) {
+      await chat.markRead(chat.activePeerId);
+      renderChatList();
+    }
+  });
   $('#discover-cta').addEventListener('click', () => {
     setView('nearby');
     startScan();
@@ -415,11 +527,7 @@ async function init() {
   $('#scan-button').addEventListener('click', startScan);
   $('#learn-more').addEventListener('click', () => $('#info-dialog').showModal());
   $('#conversation-info').addEventListener('click', () => $('#info-dialog').showModal());
-  $('#back-chats').addEventListener('click', () => {
-    chat.activePeerId = null;
-    $('#conversation-panel').classList.add('hidden');
-    $('#welcome-panel').classList.remove('hidden');
-  });
+  $('#back-chats').addEventListener('click', closeConversation);
   $('#message-form').addEventListener('submit', sendMessage);
   $('#attach-button').addEventListener('click', () => $('#file-input').click());
   $('#file-input').addEventListener('change', handleFile);
@@ -629,11 +737,13 @@ async function sendMessage(event) {
     // 'delivered' is final, so a receipt that already arrived is kept.
     await chat.updateMessageStatus(message.id, 'sent');
     await renderMessages();
+    renderChatList();
     toast('Encrypted message sent. Waiting for receipt…');
   } catch (error) {
     console.error('Encrypted BLE send failed:', error);
     await chat.updateMessageStatus(message.id, 'failed');
     await renderMessages();
+    renderChatList();
     toast(error.message || 'Message could not be sent.');
   }
 }

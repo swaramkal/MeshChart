@@ -94,7 +94,9 @@ export class MeshDatabase {
     return this.request(this.transaction('conversations').getAll());
   }
 
-  async saveConversation(conversation) {
+  // touch: false keeps the existing sort time, for changes that are not new
+  // activity (unread count, delivery tick on the last message).
+  async saveConversation(conversation, { touch = true } = {}) {
     if (!conversation?.peerId || !conversation?.peerName) {
       throw new Error('A peer ID and display name are required.');
     }
@@ -103,12 +105,32 @@ export class MeshDatabase {
       this.transaction('conversations').get(conversation.peerId)
     );
 
+    const merged = { ...previous, ...conversation };
+
     return this.request(
       this.transaction('conversations', 'readwrite').put({
-        ...previous,
-        ...conversation,
-        updatedAt: Date.now()
+        ...merged,
+        updatedAt: touch
+          ? Date.now()
+          : (conversation.updatedAt ?? previous?.updatedAt ?? Date.now())
       })
+    );
+  }
+
+  async deleteConversation(peerId) {
+    if (!peerId) return;
+
+    const messages = await this.getMessages(peerId);
+
+    if (messages.length) {
+      const store = this.transaction('messages', 'readwrite');
+      await Promise.all(
+        messages.map((message) => this.request(store.delete(message.id)))
+      );
+    }
+
+    await this.request(
+      this.transaction('conversations', 'readwrite').delete(peerId)
     );
   }
 
